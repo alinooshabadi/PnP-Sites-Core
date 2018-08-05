@@ -7,23 +7,19 @@ using File = Microsoft.SharePoint.Client.File;
 using OfficeDevPnP.Core.Diagnostics;
 using OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers.Extensions;
 using System;
-using System.Text.RegularExpressions;
-using Microsoft.SharePoint.Client.WebParts;
-using System.Xml.Linq;
 using System.Net;
-using System.Text;
-using System.Web;
 using System.IO;
 using Newtonsoft.Json;
 using OfficeDevPnP.Core.Utilities;
 using Microsoft.SharePoint.Client.Taxonomy;
+using OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers.TokenDefinitions;
 
 namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
 {
     internal class ObjectFiles : ObjectHandlerBase
     {
         private readonly string[] WriteableReadOnlyFields = new string[] { "publishingpagelayout", "contenttypeid" };
-        
+
         // See https://support.office.com/en-us/article/Turn-scripting-capabilities-on-or-off-1f2c515f-5d7e-448a-9fd7-835da935584f?ui=en-US&rs=en-US&ad=US
         public static readonly string[] BlockedExtensionsInNoScript = new string[] { ".asmx", ".ascx", ".aspx", ".htc", ".jar", ".master", ".swf", ".xap", ".xsf" };
         public static readonly string[] BlockedLibrariesInNoScript = new string[] { "_catalogs/theme", "style library", "_catalogs/lt", "_catalogs/wp" };
@@ -39,9 +35,6 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
             {
                 // Check if this is not a noscript site as we're not allowed to write to the web property bag is that one
                 bool isNoScriptSite = web.IsNoScriptSite();
-
-                var context = web.Context as ClientContext;
-
                 web.EnsureProperties(w => w.ServerRelativeUrl, w => w.Url);
 
                 // Build on the fly the list of additional files coming from the Directories
@@ -52,35 +45,49 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
                     directoryFiles.AddRange(directory.GetDirectoryFiles(metadataProperties));
                 }
 
-                foreach (var file in template.Files.Union(directoryFiles))
+                var filesToProcess = template.Files.Union(directoryFiles).ToArray();
+                var currentFileIndex = 0;
+                var originalWeb = web; // Used to store and re-store context in case files are deployed to masterpage gallery
+                foreach (var file in filesToProcess)
                 {
+                    file.Src = parser.ParseString(file.Src);
+                    var targetFileName = !String.IsNullOrEmpty(file.TargetFileName) ? file.TargetFileName : file.Src;
+
+                    currentFileIndex++;
+                    WriteMessage($"File|{targetFileName}|{currentFileIndex}|{filesToProcess.Length}", ProvisioningMessageType.Progress);
                     var folderName = parser.ParseString(file.Folder);
+
+                    if (folderName.ToLower().Contains("/_catalogs/"))
+                    {
+                        // Edge case where you have files in the template which should be provisioned to the site collection
+                        // master page gallery and not to a connected subsite
+                        web = web.Context.GetSiteCollectionContext().Web;
+                        web.EnsureProperties(w => w.ServerRelativeUrl, w => w.Url);
+                    }
 
                     if (folderName.ToLower().StartsWith((web.ServerRelativeUrl.ToLower())))
                     {
                         folderName = folderName.Substring(web.ServerRelativeUrl.Length);
                     }
 
-                    if (SkipFile(isNoScriptSite, file.Src, folderName))
+                    if (SkipFile(isNoScriptSite, targetFileName, folderName))
                     {
                         // add log message
-                        scope.LogWarning(CoreResources.Provisioning_ObjectHandlers_Files_SkipFileUpload, file.Src, folderName);
+                        scope.LogWarning(CoreResources.Provisioning_ObjectHandlers_Files_SkipFileUpload, targetFileName, folderName);
                         continue;
                     }
 
                     var folder = web.EnsureFolderPath(folderName);
 
-                    File targetFile = null;
-
                     var checkedOut = false;
 
-                    targetFile = folder.GetFile(template.Connector.GetFilenamePart(file.Src));
+                    var targetFile = folder.GetFile(template.Connector.GetFilenamePart(targetFileName));
 
                     if (targetFile != null)
                     {
                         if (file.Overwrite)
                         {
-                            scope.LogDebug(CoreResources.Provisioning_ObjectHandlers_Files_Uploading_and_overwriting_existing_file__0_, file.Src);
+                            scope.LogDebug(CoreResources.Provisioning_ObjectHandlers_Files_Uploading_and_overwriting_existing_file__0_, targetFileName);
                             checkedOut = CheckOutIfNeeded(web, targetFile);
 
                             using (var stream = GetFileStream(template, file))
@@ -97,7 +104,7 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
                     {
                         using (var stream = GetFileStream(template, file))
                         {
-                            scope.LogDebug(CoreResources.Provisioning_ObjectHandlers_Files_Uploading_file__0_, file.Src);
+                            scope.LogDebug(CoreResources.Provisioning_ObjectHandlers_Files_Uploading_file__0_, targetFileName);
                             targetFile = UploadFile(template, file, folder, stream);
                         }
 
@@ -106,32 +113,62 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
 
                     if (targetFile != null)
                     {
+                        // Add the fileuniqueid tokens
+#if !SP2013
+                        targetFile.EnsureProperties(p => p.UniqueId, p => p.ServerRelativeUrl);
+                        parser.AddToken(new FileUniqueIdToken(web, targetFile.ServerRelativeUrl.Substring(web.ServerRelativeUrl.Length).TrimStart("/".ToCharArray()), targetFile.UniqueId));
+                        parser.AddToken(new FileUniqueIdEncodedToken(web, targetFile.ServerRelativeUrl.Substring(web.ServerRelativeUrl.Length).TrimStart("/".ToCharArray()), targetFile.UniqueId));
+#endif
                         if (file.Properties != null && file.Properties.Any())
                         {
                             Dictionary<string, string> transformedProperties = file.Properties.ToDictionary(property => property.Key, property => parser.ParseString(property.Value));
                             SetFileProperties(targetFile, transformedProperties, false);
                         }
 
+#if !SP2013
+                        bool webPartsNeedLocalization = false;
+#endif
                         if (file.WebParts != null && file.WebParts.Any())
                         {
                             targetFile.EnsureProperties(f => f.ServerRelativeUrl);
 
-                            var existingWebParts = web.GetWebParts(targetFile.ServerRelativeUrl);
-                            foreach (var webpart in file.WebParts)
+                            var existingWebParts = web.GetWebParts(targetFile.ServerRelativeUrl).ToList();
+                            foreach (var webPart in file.WebParts)
                             {
                                 // check if the webpart is already set on the page
-                                if (existingWebParts.FirstOrDefault(w => w.WebPart.Title == webpart.Title) == null)
+                                if (existingWebParts.FirstOrDefault(w => w.WebPart.Title == parser.ParseString(webPart.Title)) == null)
                                 {
-                                    scope.LogDebug(CoreResources.Provisioning_ObjectHandlers_Files_Adding_webpart___0___to_page, webpart.Title);
+                                    scope.LogDebug(CoreResources.Provisioning_ObjectHandlers_Files_Adding_webpart___0___to_page, webPart.Title);
                                     var wpEntity = new WebPartEntity();
-                                    wpEntity.WebPartTitle = webpart.Title;
-                                    wpEntity.WebPartXml = parser.ParseString(webpart.Contents).Trim(new[] { '\n', ' ' });
-                                    wpEntity.WebPartZone = webpart.Zone;
-                                    wpEntity.WebPartIndex = (int)webpart.Order;
-                                    web.AddWebPartToWebPartPage(targetFile.ServerRelativeUrl, wpEntity);
+                                    wpEntity.WebPartTitle = parser.ParseString(webPart.Title);
+                                    wpEntity.WebPartXml = parser.ParseXmlString(webPart.Contents).Trim(new[] { '\n', ' ' });
+                                    wpEntity.WebPartZone = webPart.Zone;
+                                    wpEntity.WebPartIndex = (int)webPart.Order;
+                                    var wpd = web.AddWebPartToWebPartPage(targetFile.ServerRelativeUrl, wpEntity);
+#if !SP2013
+                                    if (webPart.Title.ContainsResourceToken())
+                                    {
+                                        // update data based on where it was added - needed in order to localize wp title
+#if !SP2016
+                                        wpd.EnsureProperties(w => w.ZoneId, w => w.WebPart, w => w.WebPart.Properties);
+                                        webPart.Zone = wpd.ZoneId;
+#else
+                                        wpd.EnsureProperties(w => w.WebPart, w => w.WebPart.Properties);
+#endif
+                                        webPart.Order = (uint)wpd.WebPart.ZoneIndex;
+                                        webPartsNeedLocalization = true;
+                                    }
+#endif
                                 }
                             }
                         }
+
+#if !SP2013
+                        if (webPartsNeedLocalization)
+                        {
+                            file.LocalizeWebParts(web, parser, targetFile, scope);
+                        }
+#endif
 
                         switch (file.Level)
                         {
@@ -164,8 +201,10 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
                         }
                     }
 
+                    web = originalWeb; // restore context in case files are provisioned to the master page gallery #1059
                 }
             }
+            WriteMessage("Done processing files", ProvisioningMessageType.Completed);
             return parser;
         }
 
@@ -174,8 +213,9 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
             var checkedOut = false;
             try
             {
-                web.Context.Load(targetFile, f => f.CheckOutType, f => f.ListItemAllFields.ParentList.ForceCheckout);
+                web.Context.Load(targetFile, f => f.CheckOutType, f => f.CheckedOutByUser, f => f.ListItemAllFields.ParentList.ForceCheckout);
                 web.Context.ExecuteQueryRetry();
+
                 if (targetFile.ListItemAllFields.ServerObjectIsNull.HasValue
                     && !targetFile.ListItemAllFields.ServerObjectIsNull.Value
                     && targetFile.ListItemAllFields.ParentList.ForceCheckout)
@@ -223,7 +263,7 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
                 catch (ServerException ex)
                 {
                     // If this throws ServerException (does not belong to list), then shouldn't be trying to set properties)
-                    if (ex.Message != "The object specified does not belong to a list.")
+                    if (ex.ServerErrorCode != -2146232832)
                     {
                         throw;
                     }
@@ -234,14 +274,14 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
                 {
                     var propertyName = kvp.Key;
                     var propertyValue = kvp.Value;
-                    
+
                     var targetField = parentList.Fields.GetByInternalNameOrTitle(propertyName);
                     targetField.EnsureProperties(f => f.TypeAsString, f => f.ReadOnlyField);
 
                     // Changed by PaoloPia because there are fields like PublishingPageLayout
                     // which are marked as read-only, but have to be overwritten while uploading
                     // a publishing page file and which in reality can still be written
-                    if (!targetField.ReadOnlyField || WriteableReadOnlyFields.Contains(propertyName.ToLower())) 
+                    if (!targetField.ReadOnlyField || WriteableReadOnlyFields.Contains(propertyName.ToLower()))
                     {
                         switch (propertyName.ToUpperInvariant())
                         {
@@ -332,7 +372,7 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
         /// <returns>True is the file will not be uploaded, false otherwise</returns>
         public static bool SkipFile(bool isNoScriptSite, string fileName, string folderName)
         {
-            string fileExtionsion = System.IO.Path.GetExtension(fileName).ToLower();
+            string fileExtionsion = Path.GetExtension(fileName).ToLower();
             if (isNoScriptSite)
             {
                 if (!String.IsNullOrEmpty(fileExtionsion) && BlockedExtensionsInNoScript.Contains(fileExtionsion))
@@ -357,33 +397,7 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
             return false;
         }
 
-        private string Tokenize(Web web, string xml)
-        {
-            var lists = web.Lists;
-            web.Context.Load(web, w => w.ServerRelativeUrl, w => w.Id);
-            web.Context.Load(lists, ls => ls.Include(l => l.Id, l => l.Title));
-            web.Context.ExecuteQueryRetry();
-
-            foreach (var list in lists)
-            {
-                xml = Regex.Replace(xml, list.Id.ToString(), string.Format("{{listid:{0}}}", list.Title), RegexOptions.IgnoreCase);
-            }
-            xml = Regex.Replace(xml, web.Id.ToString(), "{siteid}", RegexOptions.IgnoreCase);
-            if (web.ServerRelativeUrl != "/")
-            {
-                xml = Regex.Replace(xml, web.ServerRelativeUrl, "{site}", RegexOptions.IgnoreCase);
-            }
-
-            return xml;
-        }
-
-        private ProvisioningTemplate CleanupEntities(ProvisioningTemplate template, ProvisioningTemplate baseTemplate)
-        {
-
-            return template;
-        }
-
-        public override bool WillProvision(Web web, ProvisioningTemplate template)
+        public override bool WillProvision(Web web, ProvisioningTemplate template, ProvisioningTemplateApplyingInformation applyingInformation)
         {
             if (!_willProvision.HasValue)
             {
@@ -404,16 +418,26 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
         private static File UploadFile(ProvisioningTemplate template, Model.File file, Microsoft.SharePoint.Client.Folder folder, Stream stream)
         {
             File targetFile = null;
-            var fileName = template.Connector.GetFilenamePart(file.Src);
+            var fileName = !String.IsNullOrEmpty(file.TargetFileName) ? file.TargetFileName : template.Connector.GetFilenamePart(file.Src);
             try
             {
                 targetFile = folder.UploadFile(fileName, stream, file.Overwrite);
             }
-            catch (Exception)
+            catch (ServerException ex)
             {
-                //The file name might contain encoded characters that prevent upload. Decode it and try again.
-                fileName = WebUtility.UrlDecode(fileName);
-                targetFile = folder.UploadFile(fileName, stream, file.Overwrite);
+                if (ex.ServerErrorCode != -2130575306) //Error code: -2130575306 = The file is already checked out.
+                {
+                    //The file name might contain encoded characters that prevent upload. Decode it and try again.
+                    fileName = WebUtility.UrlDecode(fileName);
+                    try
+                    {
+                        targetFile = folder.UploadFile(fileName, stream, file.Overwrite);
+                    }
+                    catch (Exception)
+                    {
+                        //unable to Upload file, just ignore
+                    }
+                }
             }
             return targetFile;
         }
@@ -431,14 +455,36 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
                 container = fileName.Substring(0, tempFileName.LastIndexOf(@"\"));
                 fileName = fileName.Substring(tempFileName.LastIndexOf(@"\") + 1);
             }
-            
+
             // add the default provided container (if any)
             if (!String.IsNullOrEmpty(container))
             {
                 if (!String.IsNullOrEmpty(template.Connector.GetContainer()))
                 {
-                    container = String.Format(@"{0}\{1}", template.Connector.GetContainer(), container);
-                }               
+                    if (container.StartsWith("/"))
+                    {
+                        container = container.TrimStart("/".ToCharArray());
+                    }
+#if !NETSTANDARD2_0
+                    if (template.Connector.GetType() == typeof(Connectors.AzureStorageConnector))
+                    {
+                        if (template.Connector.GetContainer().EndsWith("/"))
+                        {
+                            container = $@"{template.Connector.GetContainer()}{container}";
+                        }
+                        else
+                        {
+                            container = $@"{template.Connector.GetContainer()}/{container}";
+                        }
+                    }
+                    else
+                    {
+                        container = $@"{template.Connector.GetContainer()}\{container}";
+                    }
+#else
+                    container = $@"{template.Connector.GetContainer()}\{container}";
+#endif
+                }
             }
             else
             {
@@ -450,6 +496,7 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
             {
                 //Decode the URL and try again
                 fileName = WebUtility.UrlDecode(fileName);
+                container = WebUtility.UrlDecode(container);
                 stream = template.Connector.GetFileStream(fileName, container);
             }
 
@@ -479,22 +526,29 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
             return (result);
         }
 
-        internal static List<Model.File> GetDirectoryFiles(this Model.Directory directory, 
+        internal static List<Model.File> GetDirectoryFiles(this Model.Directory directory,
             Dictionary<String, Dictionary<String, String>> metadataProperties = null)
         {
             var result = new List<Model.File>();
 
-            var files = directory.ParentTemplate.Connector.GetFiles(directory.Src);
+            // If the connector has a container specified we need to take that in account to find the files we need
+            string folderToGrabFilesFrom = directory.Src;
+            if (!String.IsNullOrEmpty(directory.ParentTemplate.Connector.GetContainer()))
+            {
+                folderToGrabFilesFrom = directory.ParentTemplate.Connector.GetContainer() + @"\" + directory.Src;
+            }
+
+            var files = directory.ParentTemplate.Connector.GetFiles(folderToGrabFilesFrom);
 
             if (!String.IsNullOrEmpty(directory.IncludedExtensions) && directory.IncludedExtensions != "*.*")
             {
-                var includedExtensions = directory.IncludedExtensions.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                var includedExtensions = directory.IncludedExtensions.Split(new [] { ',' }, StringSplitOptions.RemoveEmptyEntries);
                 files = files.Where(f => includedExtensions.Contains($"*{Path.GetExtension(f).ToLower()}")).ToList();
             }
 
             if (!String.IsNullOrEmpty(directory.ExcludedExtensions))
             {
-                var excludedExtensions = directory.ExcludedExtensions.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                var excludedExtensions = directory.ExcludedExtensions.Split(new [] { ',' }, StringSplitOptions.RemoveEmptyEntries);
                 files = files.Where(f => !excludedExtensions.Contains($"*{Path.GetExtension(f).ToLower()}")).ToList();
             }
 
@@ -504,19 +558,26 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
                                 directory.Folder,
                                 directory.Overwrite,
                                 null, // No WebPartPages are supported with this technique
-                                metadataProperties != null ? metadataProperties[directory.Src + @"\" + file] : null,
+                                metadataProperties != null && metadataProperties.ContainsKey(directory.Src + @"\" + file) ? 
+                                    metadataProperties[directory.Src + @"\" + file] : null,
                                 directory.Security,
                                 directory.Level
                                 ));
 
             if (directory.Recursive)
             {
-                var subFolders = directory.ParentTemplate.Connector.GetFolders(directory.Src);
+                var subFolders = directory.ParentTemplate.Connector.GetFolders(folderToGrabFilesFrom);
+                var parentFolder = directory;
                 foreach (var folder in subFolders)
                 {
-                    directory.Src += @"\" + folder;
-                    directory.Folder += @"\" + folder;
+                    directory.Src = parentFolder.Src + @"\" + folder;
+                    directory.Folder = parentFolder.Folder + @"\" + folder;
+
                     result.AddRange(directory.GetDirectoryFiles(metadataProperties));
+
+                    //Remove the subfolder path(added above) as the second subfolder should come under its parent folder and not under its sibling
+                    parentFolder.Src = parentFolder.Src.Substring(0, parentFolder.Src.LastIndexOf(@"\"));
+                    parentFolder.Folder = parentFolder.Folder.Substring(0, parentFolder.Folder.LastIndexOf(@"\"));
                 }
             }
 

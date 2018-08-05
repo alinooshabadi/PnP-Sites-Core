@@ -309,7 +309,7 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
             String fileUrl = originalFileUrl.Substring(0, originalFileUrl.LastIndexOf("/"));
             String fileName = FixFileName(originalFileUrl.Substring(originalFileUrl.LastIndexOf("/") + 1));
 
-            String result = String.Format("{0}/{1}", fileUrl, fileName);
+            String result = $"{fileUrl}/{fileName}";
 
             return (result);
         }
@@ -338,11 +338,11 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
             return template;
         }
 
-        public override bool WillProvision(Web web, ProvisioningTemplate template)
+        public override bool WillProvision(Web web, ProvisioningTemplate template, ProvisioningTemplateApplyingInformation applyingInformation)
         {
             if (!_willProvision.HasValue)
             {
-                _willProvision = (template.ComposedLook != null && !template.ComposedLook.Equals(ComposedLook.Empty));
+                _willProvision = (template.ComposedLook != null && !template.ComposedLook.Equals(ComposedLook.Empty) && !web.IsNoScriptSite());
             }
             return _willProvision.Value;
         }
@@ -351,7 +351,7 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
         {
             if (!_willExtract.HasValue)
             {
-                _willExtract = true;
+                _willExtract = !web.IsNoScriptSite();
             }
             return _willExtract.Value;
         }

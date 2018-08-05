@@ -15,8 +15,11 @@ namespace Microsoft.SharePoint.Client
     /// </summary>
     public static class BaseTemplateManager
     {
-        private static readonly Guid PUBLISHING_FEATURE_WEB = new Guid("94c94ca6-b32f-4da9-a9e3-1f3d343d7ecb");
-
+        /// <summary>
+        /// Gets the base template.
+        /// </summary>
+        /// <param name="web">the target web to get template</param>
+        /// <returns>Returns a ProvisioningTemplate object</returns>
         public static ProvisioningTemplate GetBaseTemplate(this Web web)
         {
             web.Context.Load(web, p => p.WebTemplate, p => p.Configuration);
@@ -32,6 +35,13 @@ namespace Microsoft.SharePoint.Client
             //}
         }
 
+        /// <summary>
+        /// Gets the provisioning template of provided webtemplate and configuration.
+        /// </summary>
+        /// <param name="web">the target web</param>
+        /// <param name="webTemplate">the name of the webtemplate</param>
+        /// <param name="configuration">configuration of template</param>
+        /// <returns>Returns a ProvisioningTemplate object</returns>
         public static ProvisioningTemplate GetBaseTemplate(this Web web, string webTemplate, short configuration)
         {
 
@@ -39,7 +49,7 @@ namespace Microsoft.SharePoint.Client
 
             try
             {
-                string baseTemplate = string.Format("OfficeDevPnP.Core.Framework.Provisioning.BaseTemplates.v{0}.{1}{2}Template.xml", GetSharePointVersion(), webTemplate, configuration);
+                string baseTemplate = $"OfficeDevPnP.Core.Framework.Provisioning.BaseTemplates.v{GetSharePointVersion()}.{webTemplate}{configuration}Template.xml";
                 using (Stream stream = typeof(BaseTemplateManager).Assembly.GetManifestResourceStream(baseTemplate))
                 {
                     // Figure out the formatter to use
@@ -73,7 +83,7 @@ namespace Microsoft.SharePoint.Client
         {
             Assembly asm = Assembly.GetAssembly(typeof(Site));
             AssemblyName name = asm.GetName();
-            return String.Format("{0}_{1}", name.Version.Major, name.Version.Minor);
+            return $"{name.Version.Major}_{name.Version.Minor}";
         }
 
     }

@@ -17,7 +17,6 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
             get { return "Pages"; }
         }
 
-
         public override TokenParser ProvisionObjects(Web web, ProvisioningTemplate template, TokenParser parser, ProvisioningTemplateApplyingInformation applyingInformation)
         {
             using (var scope = new PnPMonitoredScope(this.Name))
@@ -61,8 +60,19 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
                             {
                                 scope.LogDebug(CoreResources.Provisioning_ObjectHandlers_Pages_Overwriting_existing_page__0_, url);
 
-                                if (page.WelcomePage && url.Contains(web.RootFolder.WelcomePage))
+                                // determine url of current home page
+                                string welcomePageUrl = web.RootFolder.WelcomePage;
+                                string welcomePageServerRelativeUrl = welcomePageUrl != null
+                                    ? UrlUtility.Combine(web.ServerRelativeUrl, web.RootFolder.WelcomePage)
+                                    : null;
+
+                                bool overwriteWelcomePage = string.Equals(url, welcomePageServerRelativeUrl, StringComparison.InvariantCultureIgnoreCase);
+
+                                // temporarily reset home page so we can delete it
+                                if (overwriteWelcomePage)
+                                {
                                     web.SetHomePage(string.Empty);
+                                }
 
                                 file.DeleteObject();
                                 web.Context.ExecuteQueryRetry();
@@ -71,8 +81,15 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
                                 {
                                     web.AddLayoutToWikiPage(WikiPageLayout.OneColumn, url);
                                 }
-                                else {
+                                else
+                                {
                                     web.AddLayoutToWikiPage(page.Layout, url);
+                                }
+
+                                if (overwriteWelcomePage)
+                                {
+                                    // restore welcome page to previous value
+                                    web.SetHomePage(welcomePageUrl);
                                 }
                             }
                             catch (Exception ex)
@@ -92,7 +109,8 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
                             {
                                 web.AddLayoutToWikiPage(WikiPageLayout.OneColumn, url);
                             }
-                            else {
+                            else
+                            {
                                 web.AddLayoutToWikiPage(page.Layout, url);
                             }
                         }
@@ -102,29 +120,53 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
                         }
                     }
 
+#pragma warning disable 618
                     if (page.WelcomePage)
+#pragma warning restore 618
                     {
                         web.RootFolder.EnsureProperty(p => p.ServerRelativeUrl);
                         var rootFolderRelativeUrl = url.Substring(web.RootFolder.ServerRelativeUrl.Length);
                         web.SetHomePage(rootFolderRelativeUrl);
                     }
 
+#if !SP2013
+                    bool webPartsNeedLocalization = false;
+#endif
                     if (page.WebParts != null & page.WebParts.Any())
                     {
                         if (!isNoScriptSite)
                         {
                             var existingWebParts = web.GetWebParts(url);
 
-                            foreach (var webpart in page.WebParts)
+                            foreach (var webPart in page.WebParts)
                             {
-                                if (existingWebParts.FirstOrDefault(w => w.WebPart.Title == webpart.Title) == null)
+                                if (existingWebParts.FirstOrDefault(w => w.WebPart.Title == parser.ParseString(webPart.Title)) == null)
                                 {
                                     WebPartEntity wpEntity = new WebPartEntity();
-                                    wpEntity.WebPartTitle = webpart.Title;
-                                    wpEntity.WebPartXml = parser.ParseString(webpart.Contents.Trim(new[] { '\n', ' ' }));
-                                    web.AddWebPartToWikiPage(url, wpEntity, (int)webpart.Row, (int)webpart.Column, false);
+                                    wpEntity.WebPartTitle = parser.ParseString(webPart.Title);
+                                    wpEntity.WebPartXml = parser.ParseXmlStringWebpart(webPart.Contents.Trim(new[] { '\n', ' ' }), web, "~sitecollection", "~site");
+                                    var wpd = web.AddWebPartToWikiPage(url, wpEntity, (int)webPart.Row, (int)webPart.Column, false);
+#if !SP2013
+                                    if (webPart.Title.ContainsResourceToken())
+                                    {
+                                        // update data based on where it was added - needed in order to localize wp title
+#if !SP2016
+                                        wpd.EnsureProperties(w => w.ZoneId, w => w.WebPart, w => w.WebPart.Properties);
+                                        webPart.Zone = wpd.ZoneId;
+#else
+                                        wpd.EnsureProperties(w => w.WebPart, w => w.WebPart.Properties);
+#endif
+                                        webPart.Order = (uint)wpd.WebPart.ZoneIndex;
+                                        webPartsNeedLocalization = true;
+                                    }
+#endif
                                 }
                             }
+
+                            // Remove any existing WebPartIdToken tokens in the parser that were added by other pages. They won't apply to this page,
+                            // and they'll cause issues if this page contains web parts with the same name as web parts on other pages.
+                            parser.Tokens.RemoveAll(t => t is WebPartIdToken);
+
                             var allWebParts = web.GetWebParts(url);
                             foreach (var webpart in allWebParts)
                             {
@@ -136,6 +178,13 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
                             scope.LogWarning(CoreResources.Provisioning_ObjectHandlers_Pages_SkipAddingWebParts, page.Url);
                         }
                     }
+
+#if !SP2013
+                    if (webPartsNeedLocalization)
+                    {
+                        page.LocalizeWebParts(web, parser, scope);
+                    }
+#endif
 
                     file = web.GetFileByServerRelativeUrl(url);
                     file.EnsureProperty(f => f.ListItemAllFields);
@@ -161,7 +210,6 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
             return parser;
         }
 
-
         public override ProvisioningTemplate ExtractObjects(Web web, ProvisioningTemplate template, ProvisioningTemplateCreationInformation creationInfo)
         {
             using (var scope = new PnPMonitoredScope(this.Name))
@@ -179,12 +227,11 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
 
         private ProvisioningTemplate CleanupEntities(ProvisioningTemplate template, ProvisioningTemplate baseTemplate)
         {
-
             return template;
         }
 
 
-        public override bool WillProvision(Web web, ProvisioningTemplate template)
+        public override bool WillProvision(Web web, ProvisioningTemplate template, ProvisioningTemplateApplyingInformation applyingInformation)
         {
             if (!_willProvision.HasValue)
             {

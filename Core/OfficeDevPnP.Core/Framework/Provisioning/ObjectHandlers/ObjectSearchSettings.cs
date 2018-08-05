@@ -69,9 +69,11 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
             return creationInfo.IncludeSearchConfiguration;
         }
 
-        public override bool WillProvision(Web web, ProvisioningTemplate template)
+        public override bool WillProvision(Web web, ProvisioningTemplate template, ProvisioningTemplateApplyingInformation applyingInformation)
         {
+#pragma warning disable 618
             return !String.IsNullOrEmpty(template.SearchSettings);
+#pragma warning restore 618
         }
     }
 }
