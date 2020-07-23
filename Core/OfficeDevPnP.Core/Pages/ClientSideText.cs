@@ -11,7 +11,7 @@ using System.Web.UI;
 
 namespace OfficeDevPnP.Core.Pages
 {
-#if !ONPREMISES
+#if !SP2013 && !SP2016
     /// <summary>
     /// Controls of type 4 ( = text control)
     /// </summary>
@@ -112,10 +112,29 @@ namespace OfficeDevPnP.Core.Pages
                     ZoneIndex = this.Section.Order,
                     SectionIndex = this.Column.Order,
                     SectionFactor = this.Column.ColumnFactor,
+#if !SP2019
+                    LayoutIndex = this.Column.LayoutIndex,
+#endif
                     ControlIndex = controlIndex,
+                },
+                Emphasis = new ClientSideSectionEmphasis()
+                {
+                    ZoneEmphasis = this.Column.VerticalSectionEmphasis.HasValue ? this.Column.VerticalSectionEmphasis.Value : this.Section.ZoneEmphasis,
                 },
                 EditorType = "CKEditor"
             };
+
+
+#if !SP2019
+            if (this.section.Type == CanvasSectionTemplate.OneColumnVerticalSection)
+            {
+                if (this.section.Columns.First().Equals(this.Column))
+                {
+                    controlData.Position.SectionFactor = 12;
+                }
+            }
+#endif
+
             jsonControlData = JsonConvert.SerializeObject(controlData);
 
             try
@@ -129,7 +148,14 @@ namespace OfficeDevPnP.Core.Pages
 #if NETSTANDARD2_0
             html.Append($@"<div {CanvasControlAttribute}=""{this.CanvasControlData}"" {CanvasDataVersionAttribute}=""{ this.DataVersion}""  {ControlDataAttribute}=""{this.jsonControlData.Replace("\"", "&quot;")}"">");
             html.Append($@"<div {TextRteAttribute}=""{this.Rte}"">");
-            html.Append($@"<p>{this.Text}</p>");
+            if (this.Text.Trim().StartsWith("<p>", StringComparison.InvariantCultureIgnoreCase))
+            {
+                html.Append(this.Text);
+            }
+            else
+            {
+                html.Append($@"<p>{this.Text}</p>");
+            }
             html.Append("</div>");
             html.Append("</div>");
 #else
@@ -138,7 +164,7 @@ namespace OfficeDevPnP.Core.Pages
                 htmlWriter.NewLine = string.Empty;
 
                 htmlWriter.AddAttribute(CanvasControlAttribute, this.CanvasControlData);
-                htmlWriter.AddAttribute(CanvasDataVersionAttribute, this.DataVersion);
+                htmlWriter.AddAttribute(CanvasDataVersionAttribute, this.CanvasDataVersion);
                 htmlWriter.AddAttribute(ControlDataAttribute, this.JsonControlData);
                 htmlWriter.RenderBeginTag(HtmlTextWriterTag.Div);
 
@@ -185,7 +211,7 @@ namespace OfficeDevPnP.Core.Pages
 
             // By default simple plain text is wrapped in a Paragraph, need to drop it to avoid getting multiple paragraphs on page edits.
             // Only drop the paragraph tag when there's only one Paragraph element underneath the DIV tag
-            if ((div.FirstChild != null && (div.FirstChild as IElement).TagName.Equals("P", StringComparison.InvariantCultureIgnoreCase)) &&
+            if ((div.FirstChild != null && (div.FirstChild as IElement) != null && (div.FirstChild as IElement).TagName.Equals("P", StringComparison.InvariantCultureIgnoreCase)) &&
                 (div.ChildElementCount == 1))
             {
                 this.Text = (div.FirstChild as IElement).InnerHtml;

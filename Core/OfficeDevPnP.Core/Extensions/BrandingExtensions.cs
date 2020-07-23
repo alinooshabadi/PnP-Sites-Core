@@ -244,9 +244,16 @@ namespace Microsoft.SharePoint.Client
             backgroundUrl = System.Net.WebUtility.UrlDecode(backgroundUrl);
             masterUrl = System.Net.WebUtility.UrlDecode(masterUrl);
 
-            web.SetMasterPageByUrl(masterUrl, resetSubsitesToInherit, updateRootOnly);
-            web.SetCustomMasterPageByUrl(masterUrl, resetSubsitesToInherit, updateRootOnly);
-            web.SetThemeByUrl(paletteUrl, fontUrl, backgroundUrl, resetSubsitesToInherit, updateRootOnly);
+            if (!string.IsNullOrEmpty(masterUrl))
+            {
+                web.SetMasterPageByUrl(masterUrl, resetSubsitesToInherit, updateRootOnly);
+                web.SetCustomMasterPageByUrl(masterUrl, resetSubsitesToInherit, updateRootOnly);
+            }
+
+            if (!string.IsNullOrWhiteSpace(paletteUrl))
+            {
+                web.SetThemeByUrl(paletteUrl, fontUrl, backgroundUrl, resetSubsitesToInherit, updateRootOnly);
+            }
 
             // Update/create the "Current" reference in the composed looks gallery
             string currentLookName = GetLocalizedCurrentValue(web);
@@ -1483,6 +1490,7 @@ namespace Microsoft.SharePoint.Client
         /// </summary>
         /// <param name="web">The Web to activate the Responsive UI to</param>
         /// <param name="infrastructureUrl">URL pointing to an infrastructure site</param>
+        [Obsolete]
         public static void EnableResponsiveUI(this Web web, string infrastructureUrl = null)
         {
             EnableResponsiveUIImplementation(web, infrastructureUrl);
@@ -1493,6 +1501,7 @@ namespace Microsoft.SharePoint.Client
         /// </summary>
         /// <param name="site">The Site to activate the Responsive UI to</param>
         /// <param name="infrastructureUrl">URL pointing to an infrastructure site</param>
+        [Obsolete]
         public static void EnableResponsiveUI(this Site site, string infrastructureUrl = null)
         {
             EnableResponsiveUIImplementation(site, infrastructureUrl);
@@ -1540,7 +1549,13 @@ namespace Microsoft.SharePoint.Client
                             if (jsFile == null)
                             {
                                 linkUrl = UploadStringAsFile(infrastructureContext.Web, targetFolder,
-                                    CoreResources.SP_Responsive_UI, "SP-Responsive-UI.js");
+#if DEBUG || DEBUG15 || DEBUG16 || DEBUG19
+                                    CoreResources.SP_Responsive_UI
+#else
+                                    CoreResources.SP_Responsive_UI_min
+#endif
+                                    , 
+                                    "SP-Responsive-UI.js");
                             }
                             else
                             {
@@ -1552,7 +1567,13 @@ namespace Microsoft.SharePoint.Client
                             if (targetFolder.GetFile("SP-Responsive-UI.css") == null)
                             {
                                 UploadStringAsFile(infrastructureContext.Web, targetFolder,
-                                    CoreResources.SP_Responsive_UI_CSS, "SP-Responsive-UI.css");
+#if DEBUG || DEBUG15 || DEBUG16 || DEBUG19
+                                    CoreResources.SP_Responsive_UI_CSS
+#else
+                                    CoreResources.SP_Responsive_UI_CSS_min
+#endif
+                                    , 
+                                    "SP-Responsive-UI.css");
                             }
                         }
                     }
@@ -1560,8 +1581,22 @@ namespace Microsoft.SharePoint.Client
                     {
                         var targetFolder = web.EnsureFolderPath("Style Library/SP.Responsive.UI");
 
-                        linkUrl = UploadStringAsFile(web, targetFolder, CoreResources.SP_Responsive_UI, "SP-Responsive-UI.js");
-                        UploadStringAsFile(web, targetFolder, CoreResources.SP_Responsive_UI_CSS, "SP-Responsive-UI.css");
+                        linkUrl = UploadStringAsFile(web, targetFolder,
+#if DEBUG || DEBUG15 || DEBUG16 || DEBUG19
+                            CoreResources.SP_Responsive_UI
+#else
+                            CoreResources.SP_Responsive_UI_min
+#endif
+                            ,
+                            "SP-Responsive-UI.js");
+                        UploadStringAsFile(web, targetFolder,
+#if DEBUG || DEBUG15 || DEBUG16 || DEBUG19
+                            CoreResources.SP_Responsive_UI_CSS
+#else
+                            CoreResources.SP_Responsive_UI_CSS_min
+#endif
+                            , 
+                            "SP-Responsive-UI.css");
                     }
 
                     // Deactive mobile feature
@@ -1611,6 +1646,7 @@ namespace Microsoft.SharePoint.Client
         /// Disables the Responsive UI on a Classic SharePoint Web
         /// </summary>
         /// <param name="web">The Web to disable the Responsive UI on</param>
+        [Obsolete]
         public static void DisableResponsiveUI(this Web web)
         {
             try
@@ -1627,6 +1663,7 @@ namespace Microsoft.SharePoint.Client
         /// Disables the Responsive UI on a Classic SharePoint Site
         /// </summary>
         /// <param name="site">The Site to disable the Responsive UI on</param>
+        [Obsolete]
         public static void DisableResponsiveUI(this Site site)
         {
             try
@@ -1660,7 +1697,11 @@ namespace Microsoft.SharePoint.Client
             catch (ServerException ex)
             {
                 // Handling the exception stating the "The object specified does not belong to a list."
+#if !ONPREMISES
+                if (ex.ServerErrorCode != -2113929210)
+#else
                 if (ex.ServerErrorCode != -2146232832)
+#endif
                 {
                     throw;
                 }

@@ -187,6 +187,7 @@ namespace Microsoft.SharePoint.Client
         private static async Task CheckOutFileImplementation(this Web web, string serverRelativeUrl)
         {
             var file = web.GetFileByServerRelativePath(ResourcePath.FromDecodedUrl(serverRelativeUrl));
+            await web.Context.ExecuteQueryAsync();
 #endif
 
             var scope = new ConditionalScope(web.Context, () => !file.ServerObjectIsNull.Value && file.Exists && file.CheckOutType == CheckOutType.None);
@@ -408,7 +409,7 @@ namespace Microsoft.SharePoint.Client
             var listItem = folder.ListItemAllFields;
 
             // If already a document set, just return the folder
-            if (listItem["ContentTypeId"].ToString() == BuiltInContentTypeId.Folder) return folder;
+            if (listItem["ContentTypeId"].ToString().StartsWith(BuiltInContentTypeId.DocumentSet)) return folder;
             listItem["ContentTypeId"] = BuiltInContentTypeId.DocumentSet;
 
             // Add missing properties            
@@ -962,8 +963,13 @@ namespace Microsoft.SharePoint.Client
         private static async Task<Folder> EnsureFolderPathImplementation(this Web web, string webRelativeUrl, params Expression<Func<Folder, object>>[] expressions)
 #endif
         {
+            
             if (webRelativeUrl == null) { throw new ArgumentNullException(nameof(webRelativeUrl)); }
 
+            if(webRelativeUrl.EndsWith("."))
+            {
+                throw new Exception("Folder names cannot end on a period (.).");
+            }
             //Web root folder should be returned if webRelativeUrl is empty
             if (webRelativeUrl.Length != 0 && string.IsNullOrWhiteSpace(webRelativeUrl)) { throw new ArgumentException(CoreResources.FileFolderExtensions_EnsureFolderPath_Folder_URL_is_required_, nameof(webRelativeUrl)); }
 
@@ -1752,7 +1758,7 @@ namespace Microsoft.SharePoint.Client
                 throw new ArgumentException(CoreResources.FileFolderExtensions_UploadFile_Destination_file_name_is_required_, nameof(fileName));
 
             if (fileName.ContainsInvalidFileFolderChars())
-                throw new ArgumentException(CoreResources.FileFolderExtensions_UploadFile_The_argument_must_be_a_single_file_name_and_cannot_contain_path_characters_, nameof(fileName));
+                throw new ArgumentException(string.Format(CoreResources.FileFolderExtensions_UploadFile_The_argument_must_be_a_single_file_name_and_cannot_contain_path_characters_, fileName), nameof(fileName));
 
             // Create the file
             var newFileInfo = new FileCreationInformation()
@@ -1774,6 +1780,7 @@ namespace Microsoft.SharePoint.Client
             return file;
         }
 
+#if !NETSTANDARD2_0
         /// <summary>
         /// Uploads a file to the specified folder by saving the binary directly (via webdav).
         /// </summary>
@@ -1855,6 +1862,7 @@ namespace Microsoft.SharePoint.Client
             return await folder.UploadFileWebDavImplementation(fileName, stream, overwriteIfExists);
         }
 #endif
+
         /// <summary>
         /// Uploads a file to the specified folder by saving the binary directly (via webdav).
         /// Note: this method does not work using app only token.
@@ -1903,6 +1911,8 @@ namespace Microsoft.SharePoint.Client
 #endif
             return file;
         }
+#endif
+
         /// <summary>
         /// Gets a file in a document library.
         /// </summary>
@@ -2074,7 +2084,7 @@ namespace Microsoft.SharePoint.Client
 #endif
 
             // Hash contents
-            HashAlgorithm ha = HashAlgorithm.Create();
+            HashAlgorithm ha = HashAlgorithm.Create("SHA");
             using (var serverStream = streamResult.Value)
                 serverHash = ha.ComputeHash(serverStream);
 
@@ -2165,7 +2175,11 @@ namespace Microsoft.SharePoint.Client
                 {
                     // If this throws ServerException (does not belong to list), then shouldn't be trying to set properties)
                     // Handling the exception stating the "The object specified does not belong to a list."
+#if !ONPREMISES
+                    if (ex.ServerErrorCode != -2113929210)
+#else
                     if (ex.ServerErrorCode != -2146232832)
+#endif
                     {
                         throw;
                     }
@@ -2381,7 +2395,11 @@ namespace Microsoft.SharePoint.Client
                     catch (ServerException ex)
                     {
                         // Handling the exception stating the "The object specified does not belong to a list."
+#if !ONPREMISES
+                        if (ex.ServerErrorCode != -2113929210)
+#else
                         if (ex.ServerErrorCode != -2146232832)
+#endif
                         {
                             // TODO Replace this with an errorcode as well, does not work with localized o365 tenants
                             if (ex.Message.StartsWith("Cannot invoke method or retrieve property from null object. Object returned by the following call stack is null.") &&
@@ -2443,5 +2461,84 @@ namespace Microsoft.SharePoint.Client
                                Replace(@"\?", ".") + "$";
         }
 
+#if !ONPREMISES
+        /// <summary>
+        /// Resets a file to its previous version.
+        /// </summary>
+        /// <param name="web">The web to process</param>
+        /// <param name="serverRelativeUrl">The server relative URL of the file to process</param>
+        /// <param name="checkinType">The type of the checkin</param>
+        /// <param name="comment">Message to be recorded with the approval</param>
+        public static async Task ResetFileToPreviousVersionAsync(this Web web, string serverRelativeUrl, CheckinType checkinType, string comment)
+        {
+            await new SynchronizationContextRemover();
+            await web.ResetFileToPreviousVersionImplementation(serverRelativeUrl, checkinType, comment);
+        }
+#endif
+
+        /// <summary>
+        /// Resets a file to its previous version.
+        /// </summary>
+        /// <param name="web">The web to process</param>
+        /// <param name="serverRelativeUrl">The server relative URL of the file to process</param>
+        /// <param name="checkinType">The type of the checkin</param>
+        /// <param name="comment">Message to be recorded with the approval</param>
+        public static void ResetFileToPreviousVersion(this Web web, string serverRelativeUrl, CheckinType checkinType, string comment)
+        {
+#if ONPREMISES
+            web.ResetFileToPreviousVersionImplementation(serverRelativeUrl, checkinType, comment);
+#else
+            Task.Run(() => web.ResetFileToPreviousVersionImplementation(serverRelativeUrl, checkinType, comment)).GetAwaiter().GetResult();
+#endif
+        }
+
+        /// <summary>
+        /// Checks in a file
+        /// </summary>
+        /// <param name="web">The web to process</param>
+        /// <param name="serverRelativeUrl">The server relative URL of the file to checkin</param>
+        /// <param name="checkinType">The type of the checkin</param>
+        /// <param name="comment">Message to be recorded with the approval</param>
+#if ONPREMISES
+	    public static void ResetFileToPreviousVersionImplementation(this Web web, string serverRelativeUrl, CheckinType checkinType, string comment)
+	    {
+		    var file = web.GetFileByServerRelativeUrl(serverRelativeUrl);
+#else
+        public static async Task ResetFileToPreviousVersionImplementation(this Web web, string serverRelativeUrl, CheckinType checkinType, string comment)
+        {
+            var file = web.GetFileByServerRelativePath(ResourcePath.FromDecodedUrl(serverRelativeUrl));
+#endif
+            var scope = new ConditionalScope(web.Context, () => !file.ServerObjectIsNull.Value && file.Exists && file.CheckOutType == CheckOutType.None);
+
+            using (scope.StartScope())
+            {
+                web.Context.Load(file, f => f.Versions);
+            }
+#if ONPREMISES
+		    web.Context.ExecuteQueryRetry();
+#else
+            await web.Context.ExecuteQueryAsync();
+#endif
+            if (scope.TestResult.Value)
+            {
+                if (file.Versions.Count > 0)
+                {
+#if ONPREMISES
+                    web.CheckOutFile(serverRelativeUrl);
+#else
+                    await web.CheckOutFileAsync(serverRelativeUrl);
+#endif
+                    var versionLabelPrevious = file.Versions[(file.Versions.Count - 1)].VersionLabel;
+                    file.Versions.RestoreByLabel(versionLabelPrevious);
+                }
+#if ONPREMISES
+			    web.Context.ExecuteQueryRetry();
+                web.CheckInFile(serverRelativeUrl, checkinType, comment);
+#else
+                await web.CheckInFileAsync(serverRelativeUrl, checkinType, comment);
+                await web.Context.ExecuteQueryAsync();
+#endif
+            }
+        }
     }
 }

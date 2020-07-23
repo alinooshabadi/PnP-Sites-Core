@@ -9,11 +9,12 @@ using FILETIME = System.Runtime.InteropServices.ComTypes.FILETIME;
 namespace OfficeDevPnP.Core.Utilities
 {
     /// <summary>
-    /// Class for getting and managing Credentials for SharePoint Online and SharePoint Onpremise
+    /// Class for getting and managing Credentials for SharePoint Online and SharePoint On-premises
     /// </summary>
     public static class CredentialManager
     {
 
+#if !NETSTANDARD2_0
         /// <summary>
         /// Returns a SharePoint Online Credential given a certain name. Add the credential in the Windows Credential Manager and create a new Windows Credential. Then add a new GENERIC Credential. The name parameter in the method maps to the Internet or network address field.
         /// </summary>
@@ -28,6 +29,7 @@ namespace OfficeDevPnP.Core.Utilities
             }
             return new SharePointOnlineCredentials(networkCredential.UserName, networkCredential.SecurePassword);
         }
+#endif
 
         /// <summary>
         /// Returns a NetworkCredential given a certain name. Add the credential in the Windows Credential Manager and create a new Windows Credential. Then add a new GENERIC Credential. The name parameter in the method maps to the Internet or network address field.

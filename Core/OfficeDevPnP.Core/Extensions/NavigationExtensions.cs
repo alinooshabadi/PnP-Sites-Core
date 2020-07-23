@@ -10,6 +10,10 @@ using System.Collections;
 using System.Linq.Expressions;
 using Microsoft.SharePoint.Client.Publishing.Navigation;
 using Microsoft.SharePoint.Client.Taxonomy;
+using OfficeDevPnP.Core.Utilities;
+using Newtonsoft.Json;
+using OfficeDevPnP.Core;
+using Newtonsoft.Json.Linq;
 
 namespace Microsoft.SharePoint.Client
 {
@@ -44,11 +48,6 @@ namespace Microsoft.SharePoint.Client
             //Read all the properties of the web
             web.Context.Load(web, w => w.AllProperties);
             web.Context.ExecuteQueryRetry();
-
-            if (!ArePublishingFeaturesActivated(web.AllProperties))
-            {
-                throw new ArgumentException("Structural navigation settings are only supported for publishing sites");
-            }
 
             // Determine if managed navigation is used...if so the other properties are not relevant
             string webNavigationSettings = web.AllProperties.GetPropertyAsString(WebNavigationSettings);
@@ -526,12 +525,13 @@ namespace Microsoft.SharePoint.Client
         /// <param name="web">Site to be processed - can be root web or sub site</param>
         /// <param name="nodeTitle">the title of node to add</param>
         /// <param name="nodeUri">the URL of node to add</param>
-        /// <param name="parentNodeTitle">if string.Empty, then will add this node as top level node</param>
+        /// <param name="parentNodeTitle">if string.Empty, then will add this node as top level node. Contains the title of the immediate parent node, for third level nodes, providing <paramref name="l1ParentNodeTitle"/> is required.</param>
         /// <param name="navigationType">the type of navigation, quick launch, top navigation or search navigation</param>
         /// <param name="isExternal">true if the link is an external link</param>
         /// <param name="asLastNode">true if the link should be added as the last node of the collection</param>
+        /// <param name="l1ParentNodeTitle">title of the first level parent, if this node is a third level navigation node</param>
         /// <returns>Newly added NavigationNode</returns>
-        public static NavigationNode AddNavigationNode(this Web web, string nodeTitle, Uri nodeUri, string parentNodeTitle, NavigationType navigationType, bool isExternal = false, bool asLastNode = true)
+        public static NavigationNode AddNavigationNode(this Web web, string nodeTitle, Uri nodeUri, string parentNodeTitle, NavigationType navigationType, bool isExternal = false, bool asLastNode = true, string l1ParentNodeTitle = null)
         {
             web.Context.Load(web, w => w.Navigation.QuickLaunch, w => w.Navigation.TopNavigationBar);
             web.Context.ExecuteQueryRetry();
@@ -555,8 +555,7 @@ namespace Microsoft.SharePoint.Client
                     }
                     else
                     {
-                        var parentNode = quickLaunch.FirstOrDefault(n => n.Title == parentNodeTitle);
-                        navigationNode = parentNode?.Children.Add(node);
+                        navigationNode = CreateNodeAsChild(web, quickLaunch, node, parentNodeTitle, l1ParentNodeTitle);
                     }
                 }
                 else if (navigationType == NavigationType.TopNavigationBar)
@@ -564,8 +563,7 @@ namespace Microsoft.SharePoint.Client
                     var topLink = web.Navigation.TopNavigationBar;
                     if (!string.IsNullOrEmpty(parentNodeTitle))
                     {
-                        var parentNode = topLink.FirstOrDefault(n => n.Title == parentNodeTitle);
-                        navigationNode = parentNode?.Children.Add(node);
+                        navigationNode = CreateNodeAsChild(web, topLink, node, parentNodeTitle, l1ParentNodeTitle);
                     }
                     else
                     {
@@ -582,6 +580,34 @@ namespace Microsoft.SharePoint.Client
             {
                 web.Context.ExecuteQueryRetry();
             }
+            return navigationNode;
+        }
+
+        /// <summary>
+        /// Creates a navigation node as a child of another (first or second level) navigation node.
+        /// </summary>
+        /// <param name="web">Site to be processed - can be root web or sub site</param>
+        /// <param name="parentNodes">Level one nodes under which the node should be created</param>
+        /// <param name="nodeToCreate">Node information</param>
+        /// <param name="parentNodeTitle">The title of the immediate parent node (level two if child should be level three, level one otherwise)</param>
+        /// <param name="l1ParentNodeTitle">The level one parent title or null, if the node to be created should be a level two node</param>
+        /// <returns></returns>
+        private static NavigationNode CreateNodeAsChild(Web web, NavigationNodeCollection parentNodes, NavigationNodeCreationInformation nodeToCreate, string parentNodeTitle, string l1ParentNodeTitle)
+        {
+            if (l1ParentNodeTitle != null)
+            {
+                var l1ParentNode = parentNodes.FirstOrDefault(n => n.Title.Equals(l1ParentNodeTitle, StringComparison.InvariantCultureIgnoreCase));
+                if (l1ParentNode == null)
+                {
+                    return null;
+                }
+                web.Context.Load(l1ParentNode.Children);
+                web.Context.ExecuteQueryRetry();
+                parentNodes = l1ParentNode.Children;
+            }
+
+            var parentNode = parentNodes.FirstOrDefault(n => n.Title.Equals(parentNodeTitle, StringComparison.InvariantCultureIgnoreCase));
+            var navigationNode = parentNode?.Children.Add(nodeToCreate);
             return navigationNode;
         }
 
@@ -693,6 +719,20 @@ namespace Microsoft.SharePoint.Client
                     searchNavigation[i].DeleteObject();
                 }
                 web.Context.ExecuteQueryRetry();
+#if !ONPREMISES
+            }
+            else if (navigationType == NavigationType.Footer)
+            {
+                var footerNavigation = web.LoadFooterNavigation();
+                if (footerNavigation != null)
+                {
+                    for (var i = footerNavigation.Count - 1; i >= 0; i--)
+                    {
+                        footerNavigation[i].DeleteObject();
+                    }
+                    web.Context.ExecuteQueryRetry();
+                }
+#endif
             }
         }
 
@@ -715,13 +755,172 @@ namespace Microsoft.SharePoint.Client
         /// <returns>Collection of NavigationNode instances</returns>
         public static NavigationNodeCollection LoadSearchNavigation(this Web web)
         {
-            var searchNav = web.Navigation.GetNodeById(1040); // 1040 is the id of the search navigation            
-            var nodeCollection = searchNav.Children;
-            web.Context.Load(searchNav);
-            web.Context.Load(nodeCollection);
-            web.Context.ExecuteQueryRetry();
-            return nodeCollection;
+            try
+            {
+                var searchNav = web.Navigation.GetNodeById(1040); // 1040 is the id of the search navigation            
+                var nodeCollection = searchNav.Children;
+                web.Context.Load(searchNav);
+                web.Context.Load(nodeCollection);
+                web.Context.ExecuteQueryRetry();
+                return nodeCollection;
+            }
+            catch
+            {
+                 return null;
+            }
         }
+
+#if !ONPREMISES
+        /// <summary>
+        /// Returns the navigation elements shown in the footer
+        /// </summary>
+        /// <param name="web">Web instance to return the footer navigation of</param>
+        /// <returns>NavigationNodeCollection containing the navigation elements shown in the footer or NULL if no navigation has been set on the footer</returns>
+        public static NavigationNodeCollection LoadFooterNavigation(this Web web)
+        {
+            var structureString = web.ExecuteGet($"/_api/navigation/MenuState?menuNodeKey='{Constants.SITEFOOTER_NODEKEY}'").GetAwaiter().GetResult();
+            var menuState = JObject.Parse(structureString);
+
+            if (menuState["StartingNodeKey"] == null)
+            {
+                var now = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss:Z");
+                web.ExecutePost($"/_api/navigation/SaveMenuState", $@"{{ ""menuState"":{{ ""Version"":""{now}"",""StartingNodeTitle"":""3a94b35f-030b-468e-80e3-b75ee84ae0ad"",""SPSitePrefix"":""/"",""SPWebPrefix"":""{web.ServerRelativeUrl}"",""FriendlyUrlPrefix"":"""",""SimpleUrl"":"""",""Nodes"":[]}}}}").GetAwaiter().GetResult();
+                structureString = web.ExecuteGet($"/_api/navigation/MenuState?menuNodeKey='{Constants.SITEFOOTER_NODEKEY}'").GetAwaiter().GetResult();
+                menuState = JObject.Parse(structureString);
+            }
+
+            if (menuState["Nodes"] != null)
+            {
+                var nodes = menuState["Nodes"] as JArray;
+                var topNode = web.Navigation.GetNodeById(Convert.ToInt32(menuState["StartingNodeKey"].Value<string>()));
+                web.Context.Load(topNode, n => n.Children.IncludeWithDefaultProperties());
+                web.Context.ExecuteQueryRetry();
+                var menuNode = topNode.Children.FirstOrDefault(n => n.Title == Constants.SITEFOOTER_MENUNODEKEY);
+                if (menuNode == null)
+                {
+                    // No navigation elements have been added to the footer
+                    return null;
+                }
+
+                // Navigation elements have been added to the footer, return them
+                menuNode.EnsureProperty(n => n.Children.IncludeWithDefaultProperties());
+                return menuNode.Children;
+            }
+            else
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Returns the title shown in the footer
+        /// </summary>
+        /// <param name="web">Web instance to return the footer title of</param>
+        /// <returns>Title shown in the footer or NULL if no title has been set</returns>
+        public static string GetFooterTitle(this Web web)
+        {
+            var structureString = web.ExecuteGet($"/_api/navigation/MenuState?menuNodeKey='{Constants.SITEFOOTER_NODEKEY}'").GetAwaiter().GetResult();
+            var menuState = JObject.Parse(structureString);
+
+            if (menuState["Nodes"] == null)
+            {
+                // No information is returned which helps us to identity the title node
+                return null;
+            }
+
+            // Retrieve the Node representing the title node
+            var titleNode = menuState["Nodes"].FirstOrDefault(n => n["Title"].Value<string>() == Constants.SITEFOOTER_TITLENODEKEY);
+
+            // Ensure the title node contains the expected child elements
+            if(titleNode == null || titleNode["Nodes"] == null || titleNode["Nodes"].Count() == 0 || titleNode["Nodes"][0]["Title"] == null)
+            {
+                // The expected child elements were not found
+                return null;
+            }
+
+            // Retrieve the title
+            var title = titleNode["Nodes"][0]["Title"].Value<string>();
+            return title;
+        }
+
+        /// <summary>
+        /// Sets the title shown in the footer
+        /// </summary>
+        /// <param name="web">Web instance to set the footer title of</param>
+        /// <param name="title">Title to show in the footer</param>
+        /// <returns>Boolean indicating if setting the title succeeded</returns>
+        public static bool SetFooterTitle(this Web web, string title)
+        {
+            web.EnsureProperty(w => w.ServerRelativeUrl);
+            var responseString = web.ExecutePost("/_api/navigation/SaveMenuState", 
+                                                @"{""menuState"":{""StartingNodeTitle"":""" + Constants.SITEFOOTER_NODEKEY + @""",""SPSitePrefix"":""/"",""SPWebPrefix"":""" + web.ServerRelativeUrl + @""",""FriendlyUrlPrefix"":"""",""SimpleUrl"":"""",""Nodes"":[{""NodeType"":0,""Title"":""" + Constants.SITEFOOTER_TITLENODEKEY + @""",""Key"":""2004"",""FriendlyUrlSegment"":"""",""Nodes"":[{""NodeType"":0,""Title"":""" + title + @""",""FriendlyUrlSegment"":""""}]}]}}").GetAwaiter().GetResult();
+            var responseJson = JObject.Parse(responseString);
+            var requestSucceeded = responseJson != null && responseJson["value"] != null && responseJson["value"].Value<string>() == "200";
+            return requestSucceeded;
+        }
+
+        /// <summary>
+        /// Returns the server relative URL of the logo shown in the footer
+        /// </summary>
+        /// <param name="web">Web instance to return the footer logo url of</param>
+        /// <returns>Server relative URL of the logo shown in the footer or NULL if no footer has been set</returns>
+        public static string GetFooterLogoUrl(this Web web)
+        {
+            var structureString = web.ExecuteGet($"/_api/navigation/MenuState?menuNodeKey='{Constants.SITEFOOTER_NODEKEY}'").GetAwaiter().GetResult();
+            var menuState = JObject.Parse(structureString);
+
+            if (menuState["Nodes"] == null)
+            {
+                // No information is returned which helps us to identity the logo node
+                return null;
+            }
+
+            // Retrieve the Node representing the logo node
+            var logoUrlNode = menuState["Nodes"].FirstOrDefault(n => n["Title"].Value<string>() == Constants.SITEFOOTER_LOGONODEKEY);
+
+            // Ensure the logo node contains the expected child elements
+            if (logoUrlNode == null || logoUrlNode["SimpleUrl"] == null)
+            {
+                // The expected child elements were not found
+                return null;
+            }
+
+            // Retrieve the logo url
+            var logoUrl = logoUrlNode["SimpleUrl"].Value<string>();
+            return logoUrl;
+        }
+
+        /// <summary>
+        /// Sets the logo shown in the footer
+        /// </summary>
+        /// <param name="web">Web instance to set the footer logo url of</param>
+        /// <param name="logoUrl">Server relative path to the logo to show in the footer</param>
+        /// <returns>Boolean indicating if setting the logo succeeded</returns>
+        public static bool SetFooterLogoUrl(this Web web, string logoUrl)
+        {
+            web.EnsureProperty(w => w.ServerRelativeUrl);
+            var responseString = web.ExecutePost("/_api/navigation/SaveMenuState",
+                                                @"{""menuState"":{""StartingNodeTitle"":""" + Constants.SITEFOOTER_NODEKEY + @""",""SPSitePrefix"":""/"",""SPWebPrefix"":""" + web.ServerRelativeUrl + @""",""FriendlyUrlPrefix"":"""",""SimpleUrl"":"""",""Nodes"":[{""NodeType"":0,""Title"":""" + Constants.SITEFOOTER_LOGONODEKEY + @""",""Key"":""2006"",""SimpleUrl"":""" + logoUrl + @""",""FriendlyUrlSegment"":""""}]}}").GetAwaiter().GetResult();
+            var responseJson = JObject.Parse(responseString);
+            var requestSucceeded = responseJson != null && responseJson["value"] != null && responseJson["value"].Value<string>() == "200";
+            return requestSucceeded;
+        }
+
+        /// <summary>
+        /// Removes the logo shown in the footer
+        /// </summary>
+        /// <param name="web">Web instance to remove the footer of</param>
+        /// <returns>Boolean indicating if removing the logo succeeded</returns>
+        public static bool RemoveFooterLogoUrl(this Web web)
+        {
+            web.EnsureProperty(w => w.ServerRelativeUrl);
+            var responseString = web.ExecutePost("/_api/navigation/SaveMenuState",
+                                                @"{""menuState"":{""StartingNodeTitle"":""" + Constants.SITEFOOTER_NODEKEY + @""",""SPSitePrefix"":""/"",""SPWebPrefix"":""" + web.ServerRelativeUrl + @""",""FriendlyUrlPrefix"":"""",""SimpleUrl"":"""",""Nodes"":[{""NodeType"":0,""Title"":""" + Constants.SITEFOOTER_LOGONODEKEY + @""",""IsDeleted"":""True"",""FriendlyUrlSegment"":""""}]}}").GetAwaiter().GetResult();
+            var responseJson = JObject.Parse(responseString);
+            var requestSucceeded = responseJson != null && responseJson["value"] != null && responseJson["value"].Value<string>() == "200";
+            return requestSucceeded;
+        }
+#endif
         #endregion
 
         #region Custom actions
@@ -809,9 +1008,12 @@ namespace Microsoft.SharePoint.Client
             targetAction.Description = customAction.Description;
             targetAction.Location = customAction.Location;
             targetAction.Sequence = customAction.Sequence;
-#if !ONPREMISES
+#if !SP2013 && !SP2016
             targetAction.ClientSideComponentId = customAction.ClientSideComponentId;
             targetAction.ClientSideComponentProperties = customAction.ClientSideComponentProperties;
+#endif
+#if !ONPREMISES
+            targetAction.HostProperties = customAction.ClientSideHostProperties;
 #endif
             if (customAction.Location == JavaScriptExtensions.SCRIPT_LOCATION)
             {
@@ -899,7 +1101,7 @@ namespace Microsoft.SharePoint.Client
         /// <param name="site">The site to process</param>
         /// <param name="expressions">List of lambda expressions of properties to load when retrieving the object</param>
         /// <returns>Returns all custom actions</returns>
-        public static IEnumerable<UserCustomAction> GetCustomActions(this Site site, params Expression<Func<UserCustomAction,object>>[] expressions)
+        public static IEnumerable<UserCustomAction> GetCustomActions(this Site site, params Expression<Func<UserCustomAction, object>>[] expressions)
         {
             var clientContext = (ClientContext)site.Context;
 
@@ -1027,7 +1229,7 @@ namespace Microsoft.SharePoint.Client
             return false;
         }
 
-#endregion
+        #endregion
     }
 
     /// <summary>

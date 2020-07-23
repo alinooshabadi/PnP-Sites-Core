@@ -441,7 +441,7 @@ namespace Microsoft.SharePoint.Client
 #endif
         }
 #if !ONPREMISES
-        // <summary>
+        /// <summary>
         /// Check if a site is closed
         /// </summary>
         /// <param name="web">Web to operate on</param>
@@ -452,7 +452,7 @@ namespace Microsoft.SharePoint.Client
             return await web.IsClosedBySitePolicyImplementation();
         }
 #endif
-        // <summary>
+        /// <summary>
         /// Check if a site is closed
         /// </summary>
         /// <param name="web">Web to operate on</param>
@@ -561,9 +561,9 @@ namespace Microsoft.SharePoint.Client
 #endif
         {
 #if ONPREMISES
-            if (web.HasSitePolicyAppliedImplementation() && !IsClosedBySitePolicyImplementation(web))
+            if (web.HasSitePolicyAppliedImplementation() && IsClosedBySitePolicyImplementation(web))
 #else
-            if (await web.HasSitePolicyAppliedImplementation() && !await web.IsClosedBySitePolicyImplementation())
+            if (await web.HasSitePolicyAppliedImplementation() && await web.IsClosedBySitePolicyImplementation())
 #endif
             {
                 ProjectPolicy.OpenProject(web.Context, web);

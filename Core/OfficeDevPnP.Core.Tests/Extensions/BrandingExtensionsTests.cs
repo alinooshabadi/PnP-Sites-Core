@@ -397,10 +397,13 @@ namespace OfficeDevPnP.Core.Tests.AppModelExtensions
         {
             using (var context = TestCommon.CreateClientContext())
             {
-                context.Web.UploadThemeFile(customColorFilePath);
-                context.Web.UploadThemeFile(customBackgroundFilePath);
-                context.Web.CreateComposedLookByName("Test_Theme", customColorFilePath, null, customBackgroundFilePath, null);
-                Assert.IsTrue(context.Web.ComposedLookExists("Test_Theme"));
+                if (System.IO.File.Exists(customColorFilePath) && System.IO.File.Exists(customBackgroundFilePath))
+                {
+                    context.Web.UploadThemeFile(customColorFilePath);
+                    context.Web.UploadThemeFile(customBackgroundFilePath);
+                    context.Web.CreateComposedLookByName("Test_Theme", customColorFilePath, null, customBackgroundFilePath, null);
+                    Assert.IsTrue(context.Web.ComposedLookExists("Test_Theme"));
+                }
             }
         }
 
@@ -635,7 +638,7 @@ namespace OfficeDevPnP.Core.Tests.AppModelExtensions
                 data.Value.CopyTo(memStream);
 
                 //Compute a hash of the file 
-                var hashAlgorithm = HashAlgorithm.Create();
+                var hashAlgorithm = HashAlgorithm.Create("SHA");
                 byte[] hash = hashAlgorithm.ComputeHash(memStream);
                 //Convert to a hex string for human consumption 
                 string hex = BitConverter.ToString(hash);

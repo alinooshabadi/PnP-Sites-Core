@@ -35,6 +35,19 @@ namespace OfficeDevPnP.Core.Tests.AppModelExtensions
             if (documentLibrary == null)
             {
                 documentLibrary = clientContext.Web.CreateList(ListTemplateType.DocumentLibrary, DocumentLibraryName, false);
+#if SP2013 // SharePoint 2013 Server Side default behaviour does not create a library with major versioning enabled. 
+                documentLibrary.EnsureProperties(
+                    d => d.EnableVersioning,
+                    d => d.MajorVersionLimit);
+
+                if (documentLibrary.EnableVersioning == false)
+                {
+                    documentLibrary.EnableVersioning = true;
+                    documentLibrary.MajorVersionLimit = 10;
+                    documentLibrary.Update();
+                    clientContext.ExecuteQueryRetry();
+                }
+#endif
             }
 
             clientContext.Load(documentLibrary.RootFolder.Folders);
@@ -54,6 +67,15 @@ namespace OfficeDevPnP.Core.Tests.AppModelExtensions
             }
 
             var fci = new FileCreationInformation();
+            fci.Content = System.IO.File.ReadAllBytes(TestFilePath2);
+            fci.Url = folder.ServerRelativeUrl + "/office365.png";
+            fci.Overwrite = true;
+
+            file = folder.Files.Add(fci);
+            clientContext.Load(file);
+            clientContext.ExecuteQueryRetry();
+
+            // Upload it again to create a new version
             fci.Content = System.IO.File.ReadAllBytes(TestFilePath1);
             fci.Url = folder.ServerRelativeUrl + "/office365.png";
             fci.Overwrite = true;
@@ -61,6 +83,8 @@ namespace OfficeDevPnP.Core.Tests.AppModelExtensions
             file = folder.Files.Add(fci);
             clientContext.Load(file);
             clientContext.ExecuteQueryRetry();
+
+
         }
 
         [TestCleanup()]
@@ -121,6 +145,29 @@ namespace OfficeDevPnP.Core.Tests.AppModelExtensions
 
         }
 
+        [TestMethod()]
+        public void ResetFileToPreviousVersionTest()
+        {
+            File oldFile = clientContext.Web.GetFileByServerRelativeUrl(file.ServerRelativeUrl);
+            clientContext.Load(oldFile, f => f.UIVersionLabel);
+            clientContext.ExecuteQueryRetry();
+
+            if (Version.TryParse(oldFile.UIVersionLabel, out Version oldVersion))
+            {
+                var expectedNewVersion = new Version(oldVersion.Major + 1, 0);
+
+                clientContext.Web.ResetFileToPreviousVersion(file.ServerRelativeUrl, checkInType, commentText);
+
+                File newFile = clientContext.Web.GetFileByServerRelativeUrl(file.ServerRelativeUrl);
+                clientContext.Load(newFile, f => f.UIVersionLabel);
+                clientContext.ExecuteQueryRetry();
+
+                Version.TryParse(newFile.UIVersionLabel, out Version receivedNewVersion);
+
+                Assert.AreEqual(receivedNewVersion, expectedNewVersion);
+            }
+        }
+
         [TestMethod]
         public void UploadFileTest()
         {
@@ -130,6 +177,7 @@ namespace OfficeDevPnP.Core.Tests.AppModelExtensions
             Assert.AreEqual(fileNameExpected, file.Name);
         }
 
+#if !NETSTANDARD2_0
         [TestMethod]
         public void UploadFileWebDavTest()
         {
@@ -143,6 +191,7 @@ namespace OfficeDevPnP.Core.Tests.AppModelExtensions
 
             Assert.AreEqual(fileNameExpected, file.Name);
         }
+#endif
 
         [TestMethod]
         public void VerifyIfUploadRequiredTest()
@@ -190,9 +239,9 @@ namespace OfficeDevPnP.Core.Tests.AppModelExtensions
             var file3 = folder.GetFile(fileName2);
             Assert.IsNull(file3, "File should not exist, but test shows it does.");
         }
-        #endregion
+#endregion
 
-        #region Folder tests
+#region Folder tests
         [TestMethod]
         public void EnsureSiteFolderTest()
         {
@@ -310,7 +359,7 @@ namespace OfficeDevPnP.Core.Tests.AppModelExtensions
             Assert.IsNotNull(ensureLibraryFolderTest);
             Assert.AreEqual(ensureLibraryFolderTest.ServerRelativeUrl.TrimEnd('/'), libraryFolder.ServerRelativeUrl.TrimEnd('/'));
         }
-        #endregion
+#endregion
 
     }
 }

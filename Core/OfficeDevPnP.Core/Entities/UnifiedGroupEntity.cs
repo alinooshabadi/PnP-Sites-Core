@@ -1,8 +1,4 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace OfficeDevPnP.Core.Entities
 {
@@ -39,5 +35,13 @@ namespace OfficeDevPnP.Core.Entities
         /// Classification of the Office 365 group
         /// </summary>
         public String Classification { get; set; }
+        /// <summary>
+        /// Visibility of the Office 365 group
+        /// </summary>
+        public String Visibility { get; set; }
+        /// <summary>
+        /// Indication if the Office 365 Group has a Microsoft Team provisioned for it
+        /// </summary>
+        public bool? HasTeam { get; set; }
     }
 }

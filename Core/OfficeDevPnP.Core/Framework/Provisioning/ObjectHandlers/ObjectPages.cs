@@ -17,6 +17,7 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
             get { return "Pages"; }
         }
 
+        public override string InternalName => "Pages";
         public override TokenParser ProvisionObjects(Web web, ProvisioningTemplate template, TokenParser parser, ProvisioningTemplateApplyingInformation applyingInformation)
         {
             using (var scope = new PnPMonitoredScope(this.Name))
@@ -132,7 +133,7 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
 #if !SP2013
                     bool webPartsNeedLocalization = false;
 #endif
-                    if (page.WebParts != null & page.WebParts.Any())
+                    if (page.WebParts != null && page.WebParts.Any())
                     {
                         if (!isNoScriptSite)
                         {
@@ -142,20 +143,18 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
                             {
                                 if (existingWebParts.FirstOrDefault(w => w.WebPart.Title == parser.ParseString(webPart.Title)) == null)
                                 {
-                                    WebPartEntity wpEntity = new WebPartEntity();
-                                    wpEntity.WebPartTitle = parser.ParseString(webPart.Title);
-                                    wpEntity.WebPartXml = parser.ParseXmlStringWebpart(webPart.Contents.Trim(new[] { '\n', ' ' }), web, "~sitecollection", "~site");
+                                    WebPartEntity wpEntity = new WebPartEntity
+                                    {
+                                        WebPartTitle = parser.ParseString(webPart.Title),
+                                        WebPartXml = parser.ParseXmlStringWebpart(webPart.Contents.Trim(new[] { '\n', ' ' }), web)
+                                    };
                                     var wpd = web.AddWebPartToWikiPage(url, wpEntity, (int)webPart.Row, (int)webPart.Column, false);
 #if !SP2013
                                     if (webPart.Title.ContainsResourceToken())
                                     {
                                         // update data based on where it was added - needed in order to localize wp title
-#if !SP2016
                                         wpd.EnsureProperties(w => w.ZoneId, w => w.WebPart, w => w.WebPart.Properties);
                                         webPart.Zone = wpd.ZoneId;
-#else
-                                        wpd.EnsureProperties(w => w.WebPart, w => w.WebPart.Properties);
-#endif
                                         webPart.Order = (uint)wpd.WebPart.ZoneIndex;
                                         webPartsNeedLocalization = true;
                                     }

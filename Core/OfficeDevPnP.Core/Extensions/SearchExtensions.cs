@@ -1,5 +1,11 @@
-﻿using Microsoft.SharePoint.Client.Search.Administration;
+﻿using Microsoft.Online.SharePoint.TenantAdministration;
+using Microsoft.SharePoint.Client.Search.Administration;
 using Microsoft.SharePoint.Client.Search.Portability;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using OfficeDevPnP.Core;
+using OfficeDevPnP.Core.Diagnostics;
+using OfficeDevPnP.Core.Utilities;
 using System;
 using System.Text;
 
@@ -88,8 +94,43 @@ namespace Microsoft.SharePoint.Client
             {
                 throw new ArgumentNullException(nameof(searchSchemaImportFilePath));
             }
-
             SetSearchConfigurationImplementation(context, searchSettingsImportLevel, System.IO.File.ReadAllText(searchSchemaImportFilePath));
+        }
+
+        /// <summary>
+        /// Imports search settings from configuration xml.
+        /// </summary>
+        /// <param name="context">Context for SharePoint objects and operations</param>
+        /// <param name="searchConfiguration">Search schema xml file path</param>
+        /// <param name="searchSettingsImportLevel">Search settings import level
+        /// Reference: http://msdn.microsoft.com/en-us/library/microsoft.sharepoint.client.search.administration.searchobjectlevel(v=office.15).aspx
+        /// </param>
+        public static void ImportSearchSettingsConfiguration(this ClientContext context, string searchConfiguration, SearchObjectLevel searchSettingsImportLevel)
+        {
+            if (string.IsNullOrEmpty(searchConfiguration))
+            {
+                throw new ArgumentNullException(nameof(searchConfiguration));
+            }
+            SetSearchConfigurationImplementation(context, searchSettingsImportLevel, searchConfiguration);
+        }
+
+
+        /// <summary>
+        /// Delete search settings from configuration xml.
+        /// </summary>
+        /// <param name="context">Context for SharePoint objects and operations</param>
+        /// <param name="searchConfiguration">Search schema xml file path</param>
+        /// <param name="searchSettingsImportLevel">Search settings import level
+        /// Reference: http://msdn.microsoft.com/en-us/library/microsoft.sharepoint.client.search.administration.searchobjectlevel(v=office.15).aspx
+        /// </param>
+        public static void DeleteSearchSettings(this ClientContext context, string searchConfiguration, SearchObjectLevel searchSettingsImportLevel)
+        {
+            if (string.IsNullOrEmpty(searchConfiguration))
+            {
+                throw new ArgumentNullException(nameof(searchConfiguration));
+            }
+
+            DeleteSearchConfigurationImplementation(context, searchSettingsImportLevel, searchConfiguration);
 
         }
 
@@ -112,7 +153,6 @@ namespace Microsoft.SharePoint.Client
         {
             SetSearchConfigurationImplementation(site.Context, SearchObjectLevel.SPSite, searchConfiguration);
         }
-
 
         /// <summary>
         /// Sets the search configuration at the specified object level
@@ -139,6 +179,50 @@ namespace Microsoft.SharePoint.Client
         }
 
         /// <summary>
+        /// Delete the search configuration - does not apply to managed properties.
+        /// </summary>
+        /// <param name="web">A SharePoint site/subsite</param>
+        /// <param name="searchConfiguration">search configuration</param>
+        public static void DeleteSearchConfiguration(this Web web, string searchConfiguration)
+        {
+            DeleteSearchConfigurationImplementation(web.Context, SearchObjectLevel.SPWeb, searchConfiguration);
+        }
+
+        /// <summary>
+        /// Delete the search configuration - does not apply to managed properties.
+        /// </summary>
+        /// <param name="site">A SharePoint site</param>
+        /// <param name="searchConfiguration">search configuration</param>
+        public static void DeleteSearchConfiguration(this Site site, string searchConfiguration)
+        {
+            DeleteSearchConfigurationImplementation(site.Context, SearchObjectLevel.SPSite, searchConfiguration);
+        }
+
+        /// <summary>
+        /// Delete the search configuration at the specified object level - does not apply to managed properties.
+        /// </summary>
+        /// <param name="context"></param>
+        /// <param name="searchObjectLevel"></param>
+        /// <param name="searchConfiguration"></param>
+        private static void DeleteSearchConfigurationImplementation(ClientRuntimeContext context, SearchObjectLevel searchObjectLevel, string searchConfiguration)
+        {
+#if ONPREMISES
+            if (searchObjectLevel == SearchObjectLevel.Ssa)
+            {
+                // Reference: https://msdn.microsoft.com/en-us/library/microsoft.sharepoint.client.search.portability.searchconfigurationportability_members.aspx
+                throw new Exception("You cannot import customized search configuration settings to a Search service application (SSA).");
+            }
+#endif
+            SearchConfigurationPortability searchConfig = new SearchConfigurationPortability(context);
+            SearchObjectOwner owner = new SearchObjectOwner(context, searchObjectLevel);
+
+            // Delete search configuration
+            searchConfig.DeleteSearchConfiguration(owner, searchConfiguration);
+            context.Load(searchConfig);
+            context.ExecuteQueryRetry();
+        }
+
+        /// <summary>
         /// Sets the search center URL on site collection (Site Settings -> Site collection administration --> Search Settings)
         /// </summary>
         /// <param name="web">SharePoint site - root web</param>
@@ -151,23 +235,57 @@ namespace Microsoft.SharePoint.Client
             }
 
             // Currently there is no direct API available to set the search center URL on web.
-            // Set search setting at web level   
+            // Set search setting at site level   
 
-            // if another value was set then respect that
-            if (String.IsNullOrEmpty(web.GetPropertyBagValueString("SRCH_SB_SET_SITE", string.Empty)))
+#if !ONPREMISES
+            #region Enable scripting if needed and context has access
+            Tenant tenant = null;
+            Site site = null;
+            ClientContext adminContext = null;
+            if (web.IsNoScriptSite() && TenantExtensions.IsCurrentUserTenantAdmin(web.Context as ClientContext))
             {
-                web.SetPropertyBagValue("SRCH_SB_SET_SITE", "{'Inherit':false,'ResultsPageAddress':null,'ShowNavigation':true}");
-            }
+                site = ((ClientContext)web.Context).Site;
+                site.EnsureProperty(s => s.Url);
 
-            if (!string.IsNullOrEmpty(searchCenterUrl))
-            {
-                // Set search center URL
-                web.SetPropertyBagValue("SRCH_ENH_FTR_URL_SITE", searchCenterUrl);
+                var adminSiteUrl = web.GetTenantAdministrationUrl();
+                adminContext = web.Context.Clone(adminSiteUrl);
+                tenant = new Tenant(adminContext);
+                tenant.SetSiteProperties(site.Url, noScriptSite: false);
             }
-            else
+            #endregion
+#endif
+
+            try
             {
-                // When search center URL is blank remove the property (like the SharePoint UI does)
-                web.RemovePropertyBagValue("SRCH_ENH_FTR_URL_SITE");
+                // if another value was set then respect that
+                if (String.IsNullOrEmpty(web.GetPropertyBagValueString("SRCH_SB_SET_SITE", string.Empty)))
+                {
+                    web.SetPropertyBagValue("SRCH_SB_SET_SITE", "{'Inherit':false,'ResultsPageAddress':null,'ShowNavigation':true}");
+                }
+
+                if (!string.IsNullOrEmpty(searchCenterUrl))
+                {
+                    // Set search center URL
+                    web.SetPropertyBagValue("SRCH_ENH_FTR_URL_SITE", searchCenterUrl);
+                }
+                else
+                {
+                    // When search center URL is blank remove the property (like the SharePoint UI does)
+                    web.RemovePropertyBagValue("SRCH_ENH_FTR_URL_SITE");
+                }
+            }
+            finally
+            {
+#if !ONPREMISES
+                #region Disable scripting if previously enabled
+                if (adminContext != null)
+                {
+                    // Reset disabling setting the property bag if needed
+                    tenant.SetSiteProperties(site.Url, noScriptSite: true);
+                    adminContext.Dispose();
+                }
+                #endregion
+#endif
             }
         }
 
@@ -195,15 +313,61 @@ namespace Microsoft.SharePoint.Client
                 throw new ArgumentNullException(nameof(searchCenterUrl));
             }
 
-            if (!string.IsNullOrEmpty(searchCenterUrl))
+            // Currently there is no direct API available to set the search center URL on web.
+            // Set search setting at web level   
+
+#if !ONPREMISES
+            #region Enable scripting if needed and context has access
+            Tenant tenant = null;
+            Site site = null;
+            ClientContext adminContext = null;
+            if (web.IsNoScriptSite() && TenantExtensions.IsCurrentUserTenantAdmin(web.Context as ClientContext))
             {
-                // Set search results page URL
-                web.SetPropertyBagValue("SRCH_SB_SET_WEB", "{\"Inherit\":false,\"ResultsPageAddress\":\"" + searchCenterUrl + "\",\"ShowNavigation\":false}");
+                site = ((ClientContext)web.Context).Site;
+                site.EnsureProperty(s => s.Url);
+
+                var adminSiteUrl = web.GetTenantAdministrationUrl();
+                adminContext = web.Context.Clone(adminSiteUrl);
+                tenant = new Tenant(adminContext);
+                tenant.SetSiteProperties(site.Url, noScriptSite: false);
             }
-            else
+            #endregion
+#endif
+
+            try
             {
-                // When search results page URL is blank remove the property (like the SharePoint UI does)
-                web.RemovePropertyBagValue("SRCH_SB_SET_WEB");
+                string keyName = web.IsSubSite() ? "SRCH_SB_SET_WEB" : "SRCH_SB_SET_SITE";
+
+                if (!string.IsNullOrEmpty(searchCenterUrl))
+                {
+                    // Set search results page URL
+                    web.SetPropertyBagValue(keyName, "{\"Inherit\":false,\"ResultsPageAddress\":\"" + searchCenterUrl + "\",\"ShowNavigation\":false}");
+                }
+                else
+                {
+                    // When search results page URL is blank remove the property (like the SharePoint UI does)
+                    web.RemovePropertyBagValue(keyName);
+                }
+            }
+            catch (ServerUnauthorizedAccessException e)
+            {
+                const string errorMsg = "For modern sites you need to be a SharePoint admin when setting the search redirect URL programatically.\n\nPlease use the classic UI at '/_layouts/15/enhancedSearch.aspx?level=sitecol'.";
+                Log.Error(e, Constants.LOGGING_SOURCE, errorMsg);
+                throw new ApplicationException(errorMsg, e);
+            }
+            finally
+            {
+#if !ONPREMISES
+
+                #region Disable scripting if previously enabled
+                if (adminContext != null)
+                {
+                    // Reset disabling setting the property bag if needed
+                    tenant.SetSiteProperties(site.Url, noScriptSite: true);
+                    adminContext.Dispose();
+                }
+                #endregion
+#endif
             }
         }
 
@@ -211,13 +375,47 @@ namespace Microsoft.SharePoint.Client
         /// Get the search results page URL for the web (Site Settings -> Search --> Search Settings)
         /// </summary>
         /// <param name="web">SharePoint site - current web</param>
+        /// <param name="urlOnly">Allows to declare to return the URL only and not the full JSON settings</param>
         /// <returns>Search results page URL for web</returns>
-        public static string GetWebSearchCenterUrl(this Web web)
+        public static string GetWebSearchCenterUrl(this Web web, bool urlOnly = false)
         {
-            // Get search results page URL of the current web
-            return web.GetPropertyBagValueString("SRCH_SB_SET_WEB", string.Empty);
+            bool isSubSite = web.IsSubSite();
+            string keyName = isSubSite ? "SRCH_SB_SET_WEB" : "SRCH_SB_SET_SITE";
+
+            // Get the Search Settings JSON value
+            var searchSettingsValue = web.GetPropertyBagValueString(keyName, string.Empty);
+            if (!isSubSite && string.IsNullOrWhiteSpace(searchSettingsValue))
+            {
+                // fallback to read web value on sc root
+                searchSettingsValue = web.GetPropertyBagValueString("SRCH_SB_SET_WEB", string.Empty);
+            }
+
+            // Convert the settings into a typed object
+            var searchSettings = JsonConvert.DeserializeAnonymousType(searchSettingsValue, new
+            {
+                Inherit = false,
+                ResultsPageAddress = String.Empty,
+                ShowNavigation = false,
+            });
+
+            if (searchSettings != null && !searchSettings.Inherit)
+            {
+                if (!urlOnly)
+                {
+                    // Return the whole JSON settings
+                    return searchSettingsValue;
+                }
+                else
+                {
+                    // Return the search results page URL of the current web
+                    return searchSettings?.ResultsPageAddress;
+                }
+            }
+            else
+            {
+                // If we're inheriting settings, just return NULL
+                return null;
+            }
         }
-
-
     }
 }

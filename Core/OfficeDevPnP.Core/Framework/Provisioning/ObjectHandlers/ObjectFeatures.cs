@@ -15,6 +15,7 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
             get { return "Features"; }
         }
 
+        public override string InternalName => "Features";
         public override TokenParser ProvisionObjects(Web web, ProvisioningTemplate template, TokenParser parser, ProvisioningTemplateApplyingInformation applyingInformation)
         {
             using (var scope = new PnPMonitoredScope(this.Name))
@@ -120,10 +121,10 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
             }
             if(parent is Site)
             {
-                parser.AddListTokens((parent as Site).RootWeb);
+                parser.RebuildListTokens((parent as Site).RootWeb);
             } else
             {
-                parser.AddListTokens(parent as Web);
+                parser.RebuildListTokens(parent as Web);
             }
             return parser;
         }

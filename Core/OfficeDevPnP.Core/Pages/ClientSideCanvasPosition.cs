@@ -2,7 +2,7 @@
 
 namespace OfficeDevPnP.Core.Pages
 {
-#if !ONPREMISES
+#if !SP2013 && !SP2016
     /// <summary>
     /// Base class representing the json control data that will describe a control versus the zones and sections on a page
     /// </summary>
@@ -24,6 +24,14 @@ namespace OfficeDevPnP.Core.Pages
         /// </summary>
         [JsonProperty(PropertyName = "sectionFactor", NullValueHandling = NullValueHandling.Ignore)]
         public int? SectionFactor { get; set; }
+
+#if !SP2019
+        /// <summary>
+        /// Gets or sets JsonProperty "layoutIndex"
+        /// </summary>
+        [JsonProperty(PropertyName = "layoutIndex", NullValueHandling = NullValueHandling.Ignore)]
+        public int? LayoutIndex { get; set; }
+#endif
     }
 #endif
 }

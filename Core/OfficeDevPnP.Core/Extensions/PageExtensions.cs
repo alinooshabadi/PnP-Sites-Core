@@ -88,7 +88,7 @@ namespace Microsoft.SharePoint.Client
 
 #if ONPREMISES
             // As long as we've no CSOM library that has the ZoneID we can't use the version check as things don't compile...
-            query = web.Context.LoadQuery(limitedWebPartManager.WebParts.IncludeWithDefaultProperties(wp => wp.Id, wp => wp.WebPart, wp => wp.WebPart.Title, wp => wp.WebPart.Properties, wp => wp.WebPart.Hidden));
+            query = web.Context.LoadQuery(limitedWebPartManager.WebParts.IncludeWithDefaultProperties(wp => wp.Id, wp => wp.ZoneId, wp => wp.WebPart, wp => wp.WebPart.Title, wp => wp.WebPart.Properties, wp => wp.WebPart.Hidden));
 #else
             if (web.Context.HasMinimalServerLibraryVersion(Constants.MINIMUMZONEIDREQUIREDSERVERVERSION))
             {
@@ -399,9 +399,19 @@ namespace Microsoft.SharePoint.Client
                 var pageUrl = $"{uri.Scheme}://{uri.Host}:{uri.Port}{serverRelativePageUrl}";
                 var request = (HttpWebRequest)WebRequest.Create($"{webUrl}/_vti_bin/exportwp.aspx?pageurl={HttpUtility.UrlKeyValueEncode(pageUrl)}&guidstring={id}");
 
+                var cookieCollection = web.Context.GetCookieCollection();
+
                 if (web.Context.Credentials != null)
                 {
                     request.Credentials = web.Context.Credentials;
+                }
+                else if (cookieCollection != null && cookieCollection.Count > 0)
+                {
+                    if (request.CookieContainer == null)
+                    {
+                       request.CookieContainer = new CookieContainer();
+                    }
+                    request.CookieContainer.Add(cookieCollection);
                 }
                 else
                 {
@@ -881,7 +891,8 @@ namespace Microsoft.SharePoint.Client
                 }
             }
         }
-#if !ONPREMISES
+        
+#if !SP2013 && !SP2016
         /// <summary>
         /// Adds a client side "modern" page to a "classic" or "modern" site
         /// </summary>
@@ -899,7 +910,7 @@ namespace Microsoft.SharePoint.Client
             }
             return page;
         }
-
+        
         /// <summary>
         /// Loads a client side "modern" page
         /// </summary>
@@ -911,6 +922,7 @@ namespace Microsoft.SharePoint.Client
             return ClientSidePage.Load((web.Context as ClientContext), pageName);
         }
 #endif
+
         /// <summary>
         /// Adds a blank Wiki page to the site pages library
         /// </summary>

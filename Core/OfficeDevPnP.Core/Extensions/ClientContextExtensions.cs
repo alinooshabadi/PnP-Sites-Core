@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.Linq;
 using System.Net;
@@ -12,13 +12,13 @@ using System.Configuration;
 using System.Threading.Tasks;
 using System.Net.Http;
 using Newtonsoft.Json;
-using System.IdentityModel.Tokens;
 using OfficeDevPnP.Core.Utilities.Async;
-#if NETSTANDARD2_0
 using System.IdentityModel.Tokens.Jwt;
-#endif
+using System.Collections.Generic;
+using OfficeDevPnP.Core.Utilities.Context;
+using OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers;
 
-#if !ONPREMISES
+#if !SP2013 && !SP2016
 using OfficeDevPnP.Core.Sites;
 #endif
 
@@ -39,6 +39,10 @@ namespace Microsoft.SharePoint.Client
         static ClientContextExtensions()
         {
             ClientContextExtensions.userAgentFromConfig = ConfigurationManager.AppSettings["SharePointPnPUserAgent"];
+            if(string.IsNullOrWhiteSpace(ClientContextExtensions.userAgentFromConfig))
+            {
+                ClientContextExtensions.userAgentFromConfig = System.Environment.GetEnvironmentVariable("SharePointPnPUserAgent", EnvironmentVariableTarget.Process);
+            }
         }
 
 
@@ -51,15 +55,16 @@ namespace Microsoft.SharePoint.Client
         /// </summary>
         /// <param name="clientContext">ClientContext to be cloned</param>
         /// <param name="siteUrl">Site URL to be used for cloned ClientContext</param>
+        /// <param name="accessTokens">Dictionary of access tokens for sites URLs</param>
         /// <returns>A ClientContext object created for the passed site URL</returns>
-        public static ClientContext Clone(this ClientRuntimeContext clientContext, string siteUrl)
+        public static ClientContext Clone(this ClientRuntimeContext clientContext, string siteUrl, Dictionary<String, String> accessTokens = null)
         {
             if (string.IsNullOrWhiteSpace(siteUrl))
             {
                 throw new ArgumentException(CoreResources.ClientContextExtensions_Clone_Url_of_the_site_is_required_, nameof(siteUrl));
             }
 
-            return clientContext.Clone(new Uri(siteUrl));
+            return clientContext.Clone(new Uri(siteUrl), accessTokens);
         }
 
 #if !ONPREMISES
@@ -102,6 +107,9 @@ namespace Microsoft.SharePoint.Client
 
 #if !ONPREMISES
             await new SynchronizationContextRemover();
+
+            // Set the TLS preference. Needed on some server os's to work when Office 365 removes support for TLS 1.0
+            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | SecurityProtocolType.Tls11 | SecurityProtocolType.Tls;
 #endif
 
             var clientTag = string.Empty;
@@ -114,6 +122,13 @@ namespace Microsoft.SharePoint.Client
 
             int retryAttempts = 0;
             int backoffInterval = delay;
+
+#if !ONPREMISES
+            int retryAfterInterval = 0;
+            bool retry = false;
+            ClientRequestWrapper wrapper = null;
+#endif
+
             if (retryCount <= 0)
                 throw new ArgumentException("Provide a retry count greater than zero.");
 
@@ -129,9 +144,7 @@ namespace Microsoft.SharePoint.Client
 
                     // Make CSOM request more reliable by disabling the return value cache. Given we 
                     // often clone context objects and the default value is
-#if !ONPREMISES
-                    clientContext.DisableReturnValueCache = true;
-#elif SP2016
+#if !SP2013
                     clientContext.DisableReturnValueCache = true;
 #endif
                     // Add event handler to "insert" app decoration header to mark the PnP Sites Core library as a known application
@@ -141,11 +154,17 @@ namespace Microsoft.SharePoint.Client
 
                     // DO NOT CHANGE THIS TO EXECUTEQUERYRETRY
 #if !ONPREMISES
-#if !NETSTANDARD2_0
-                    await clientContext.ExecuteQueryAsync();
-#else
-                    clientContext.ExecuteQuery();
-#endif
+                    if (!retry)
+                    {
+                        await clientContext.ExecuteQueryAsync();
+                    }
+                    else
+                    {
+                        if (wrapper != null && wrapper.Value != null)
+                        {
+                            await clientContext.RetryQueryAsync(wrapper.Value);
+                        }
+                    }
 #else
                     clientContext.ExecuteQuery();
 #endif
@@ -160,12 +179,36 @@ namespace Microsoft.SharePoint.Client
                     var response = wex.Response as HttpWebResponse;
                     // Check if request was throttled - http status code 429
                     // Check is request failed due to server unavailable - http status code 503
-                    if (response != null && (response.StatusCode == (HttpStatusCode)429 || response.StatusCode == (HttpStatusCode)503))
+                    if (response != null && 
+                        (response.StatusCode == (HttpStatusCode)429 
+                        || response.StatusCode == (HttpStatusCode)503 
+                        // || response.StatusCode == (HttpStatusCode)500
+                        ))
                     {
                         Log.Warning(Constants.LOGGING_SOURCE, CoreResources.ClientContextExtensions_ExecuteQueryRetry, backoffInterval);
-                        //Add delay for retry
+
 #if !ONPREMISES
-                        await Task.Delay(backoffInterval);
+                        wrapper = (ClientRequestWrapper)wex.Data["ClientRequest"];
+                        retry = true;
+
+                        // Determine the retry after value - use the retry-after header when available
+                        // Retry-After seems to default to a fixed 120 seconds in most cases, let's revert to our
+                        // previous logic
+                        //string retryAfterHeader = response.GetResponseHeader("Retry-After");
+                        //if (!string.IsNullOrEmpty(retryAfterHeader))
+                        //{
+                        //    if (!Int32.TryParse(retryAfterHeader, out retryAfterInterval))
+                        //    {
+                        //        retryAfterInterval = backoffInterval;
+                        //    }
+                        //}
+                        //else
+                        //{
+                        retryAfterInterval = backoffInterval;
+                        //}
+
+                        //Add delay for retry, retry-after header is specified in seconds
+                        await Task.Delay(retryAfterInterval);
 #else
                         Thread.Sleep(backoffInterval);
 #endif
@@ -176,11 +219,41 @@ namespace Microsoft.SharePoint.Client
                     }
                     else
                     {
-                        Log.Error(Constants.LOGGING_SOURCE, CoreResources.ClientContextExtensions_ExecuteQueryRetryException, wex.ToString());
+                        var errorSb = new System.Text.StringBuilder();
+
+                        errorSb.AppendLine(wex.ToString());
+
+                        if (response != null)
+                        {
+                            //if(response.Headers["SPRequestGuid"] != null) 
+                            if (response.Headers.AllKeys.Any(k => string.Equals(k, "SPRequestGuid", StringComparison.InvariantCultureIgnoreCase)))
+                            {
+                                var spRequestGuid = response.Headers["SPRequestGuid"];
+                                errorSb.AppendLine($"ServerErrorTraceCorrelationId: {spRequestGuid}");
+                            }
+                        }
+
+                        Log.Error(Constants.LOGGING_SOURCE, CoreResources.ClientContextExtensions_ExecuteQueryRetryException, errorSb.ToString());
                         throw;
                     }
                 }
+                catch (Microsoft.SharePoint.Client.ServerException serverEx)
+                {
+                    var errorSb = new System.Text.StringBuilder();
+
+                    errorSb.AppendLine(serverEx.ToString());
+                    errorSb.AppendLine($"ServerErrorCode: {serverEx.ServerErrorCode}");
+                    errorSb.AppendLine($"ServerErrorTypeName: {serverEx.ServerErrorTypeName}");
+                    errorSb.AppendLine($"ServerErrorTraceCorrelationId: {serverEx.ServerErrorTraceCorrelationId}");
+                    errorSb.AppendLine($"ServerErrorValue: {serverEx.ServerErrorValue}");
+                    errorSb.AppendLine($"ServerErrorDetails: {serverEx.ServerErrorDetails}");
+
+                    Log.Error(Constants.LOGGING_SOURCE, CoreResources.ClientContextExtensions_ExecuteQueryRetryException, errorSb.ToString());
+
+                    throw;
+                }
             }
+            
             throw new MaximumRetryAttemptedException($"Maximum retry attempts {retryCount}, has be attempted.");
         }
 
@@ -230,42 +303,48 @@ namespace Microsoft.SharePoint.Client
             return clientTag;
         }
 
-
         /// <summary>
         /// Clones a ClientContext object while "taking over" the security context of the existing ClientContext instance
         /// </summary>
         /// <param name="clientContext">ClientContext to be cloned</param>
         /// <param name="siteUrl">Site URL to be used for cloned ClientContext</param>
+        /// <param name="accessTokens">Dictionary of access tokens for sites URLs</param>
         /// <returns>A ClientContext object created for the passed site URL</returns>
-        public static ClientContext Clone(this ClientRuntimeContext clientContext, Uri siteUrl)
+        public static ClientContext Clone(this ClientRuntimeContext clientContext, Uri siteUrl, Dictionary<String, String> accessTokens = null)
+        {
+            return Clone(clientContext, new ClientContext(siteUrl), siteUrl, accessTokens);
+        }
+        /// <summary>
+        /// Clones a ClientContext object while "taking over" the security context of the existing ClientContext instance
+        /// </summary>
+        /// <param name="clientContext">ClientContext to be cloned</param>
+        /// <param name="targetContext">CientContext stub to be used for cloning</param>
+        /// <param name="siteUrl">Site URL to be used for cloned ClientContext</param>
+        /// <param name="accessTokens">Dictionary of access tokens for sites URLs</param>
+        /// <returns>A ClientContext object created for the passed site URL</returns>
+        internal static ClientContext Clone(this ClientRuntimeContext clientContext, ClientContext targetContext, Uri siteUrl, Dictionary<String, String> accessTokens = null)
         {
             if (siteUrl == null)
             {
                 throw new ArgumentException(CoreResources.ClientContextExtensions_Clone_Url_of_the_site_is_required_, nameof(siteUrl));
             }
 
-            ClientContext clonedClientContext = new ClientContext(siteUrl);
+            ClientContext clonedClientContext = targetContext;
+#if !NETSTANDARD2_0
             clonedClientContext.AuthenticationMode = clientContext.AuthenticationMode;
+#endif
             clonedClientContext.ClientTag = clientContext.ClientTag;
-#if !ONPREMISES
-            clonedClientContext.DisableReturnValueCache = clientContext.DisableReturnValueCache;
-#elif SP2016
+#if !SP2013
             clonedClientContext.DisableReturnValueCache = clientContext.DisableReturnValueCache;
 #endif
-
 
             // In case of using networkcredentials in on premises or SharePointOnlineCredentials in Office 365
             if (clientContext.Credentials != null)
             {
                 clonedClientContext.Credentials = clientContext.Credentials;
-            }
-            else
-            {
-                //Take over the form digest handling setting
-                clonedClientContext.FormDigestHandlingEnabled = (clientContext as ClientContext).FormDigestHandlingEnabled;
 
-                // In case of app only or SAML
-                clonedClientContext.ExecutingWebRequest += delegate (object oSender, WebRequestEventArgs webRequestEventArgs)
+                // In case of existing Event Handlers
+                clonedClientContext.ExecutingWebRequest += (sender, webRequestEventArgs) =>
                 {
                     // Call the ExecutingWebRequest delegate method from the original ClientContext object, but pass along the webRequestEventArgs of 
                     // the new delegate method
@@ -274,8 +353,157 @@ namespace Microsoft.SharePoint.Client
                     methodInfo.Invoke(clientContext, parametersArray);
                 };
             }
+            else
+            {
+                // Check if we do have context settings
+                var contextSettings = clientContext.GetContextSettings();
+
+                if (contextSettings != null) // We do have more information about this client context, so let's use it to do a more intelligent clone
+                {
+                    string newSiteUrl = siteUrl.ToString();
+
+                    // A diffent host = different audience ==> new access token is needed
+                    if (contextSettings.UsesDifferentAudience(newSiteUrl))
+                    {
+                        // We need to create a new context using a new authentication manager as the token expiration is handled in there
+                        OfficeDevPnP.Core.AuthenticationManager authManager = new OfficeDevPnP.Core.AuthenticationManager();
+
+                        ClientContext newClientContext = null;
+                        if (contextSettings.Type == ClientContextType.SharePointACSAppOnly)
+                        {
+                            newClientContext = authManager.GetAppOnlyAuthenticatedContext(newSiteUrl, TokenHelper.GetRealmFromTargetUrl(new Uri(newSiteUrl)), contextSettings.ClientId, contextSettings.ClientSecret, contextSettings.AcsHostUrl, contextSettings.GlobalEndPointPrefix);
+                        }
+#if !ONPREMISES && !NETSTANDARD2_0
+                        else if (contextSettings.Type == ClientContextType.AzureADCredentials)
+                        {
+                            newClientContext = authManager.GetAzureADCredentialsContext(newSiteUrl, contextSettings.UserName, contextSettings.Password);
+                        }
+                        else if (contextSettings.Type == ClientContextType.AzureADCertificate)
+                        {
+                            newClientContext = authManager.GetAzureADAppOnlyAuthenticatedContext(newSiteUrl, contextSettings.ClientId, contextSettings.Tenant, contextSettings.Certificate, contextSettings.Environment);
+                        }
+#endif
+
+                        if (newClientContext != null)
+                        {
+                            //Take over the form digest handling setting
+#if !NETSTANDARD2_0
+                            newClientContext.FormDigestHandlingEnabled = (clientContext as ClientContext).FormDigestHandlingEnabled;
+#endif
+                            newClientContext.ClientTag = clientContext.ClientTag;
+#if !SP2013
+                            newClientContext.DisableReturnValueCache = clientContext.DisableReturnValueCache;
+#endif
+                            return newClientContext;
+                        }
+                        else
+                        {
+                            throw new Exception($"Cloning for context setting type {contextSettings.Type} was not yet implemented");
+                        }
+                    }
+                    else
+                    {
+                        // Take over the context settings, this is needed if we later on want to clone this context to a different audience
+                        contextSettings.SiteUrl = newSiteUrl;
+                        clonedClientContext.AddContextSettings(contextSettings);
+
+                        clonedClientContext.ExecutingWebRequest += delegate (object oSender, WebRequestEventArgs webRequestEventArgs)
+                        {
+                            // Call the ExecutingWebRequest delegate method from the original ClientContext object, but pass along the webRequestEventArgs of 
+                            // the new delegate method
+                            MethodInfo methodInfo = clientContext.GetType().GetMethod("OnExecutingWebRequest", BindingFlags.Instance | BindingFlags.NonPublic);
+                            object[] parametersArray = new object[] { webRequestEventArgs };
+                            methodInfo.Invoke(clientContext, parametersArray);
+                        };
+                    }
+                }
+                else // Fallback the default cloning logic if there were not context settings available
+                {
+                    //Take over the form digest handling setting
+#if !NETSTANDARD2_0
+                    clonedClientContext.FormDigestHandlingEnabled = (clientContext as ClientContext).FormDigestHandlingEnabled;
+#endif
+
+                    var originalUri = new Uri(clientContext.Url);
+                    // If the cloned host is not the same as the original one
+                    // and if there is an active PnPProvisioningContext
+                    if (originalUri.Host != siteUrl.Host &&
+                        PnPProvisioningContext.Current != null)
+                    {
+                        // Let's apply that specific Access Token
+                        clonedClientContext.ExecutingWebRequest += (sender, args) =>
+                        {
+                            // We get a fresh new Access Token for every request, to avoid using an expired one
+                            var accessToken = PnPProvisioningContext.Current.AcquireToken(siteUrl.Authority, null);
+                            args.WebRequestExecutor.RequestHeaders["Authorization"] = "Bearer " + accessToken;
+                        };
+                    }
+                    // Else if the cloned host is not the same as the original one
+                    // and if there is a custom Access Token for it in the input arguments
+                    else if (originalUri.Host != siteUrl.Host &&
+                        accessTokens != null && accessTokens.Count > 0 &&
+                        accessTokens.ContainsKey(siteUrl.Authority))
+                    {
+                        // Let's apply that specific Access Token
+                        clonedClientContext.ExecutingWebRequest += (sender, args) =>
+                        {
+                            args.WebRequestExecutor.RequestHeaders["Authorization"] = "Bearer " + accessTokens[siteUrl.Authority];
+                        };
+                    }
+                    // Else if the cloned host is not the same as the original one
+                    // and if the client context is a PnPClientContext with custom access tokens in its property bag
+                    else if (originalUri.Host != siteUrl.Host &&
+                        accessTokens == null && clientContext is PnPClientContext &&
+                        ((PnPClientContext)clientContext).PropertyBag.ContainsKey("AccessTokens") &&
+                        ((Dictionary<string, string>)((PnPClientContext)clientContext).PropertyBag["AccessTokens"]).ContainsKey(siteUrl.Authority))
+                    {
+                        // Let's apply that specific Access Token
+                        clonedClientContext.ExecutingWebRequest += (sender, args) =>
+                        {
+                            args.WebRequestExecutor.RequestHeaders["Authorization"] = "Bearer " + ((Dictionary<string, string>)((PnPClientContext)clientContext).PropertyBag["AccessTokens"])[siteUrl.Authority];
+                        };
+                    }
+                    else
+                    {
+                        // In case of app only or SAML
+                        clonedClientContext.ExecutingWebRequest += (sender, webRequestEventArgs) =>
+                        {
+                            // Call the ExecutingWebRequest delegate method from the original ClientContext object, but pass along the webRequestEventArgs of 
+                            // the new delegate method
+                            MethodInfo methodInfo = clientContext.GetType().GetMethod("OnExecutingWebRequest", BindingFlags.Instance | BindingFlags.NonPublic);
+                            object[] parametersArray = new object[] { webRequestEventArgs };
+                            methodInfo.Invoke(clientContext, parametersArray);
+                        };
+                    }
+                }
+            }
 
             return clonedClientContext;
+        }
+
+        /// <summary>
+        /// Returns the number of pending requests
+        /// </summary>
+        /// <param name="clientContext">Client context to check the pending requests for</param>
+        /// <returns>The number of pending requests</returns>
+        public static int PendingRequestCount(this ClientRuntimeContext clientContext)
+        {
+            int count = 0;
+
+            if (clientContext.HasPendingRequest)
+            {
+                var result = clientContext.PendingRequest.GetType().GetProperty("Actions", BindingFlags.GetProperty | BindingFlags.Instance | BindingFlags.NonPublic);
+                if (result != null)
+                {
+                    var propValue = result.GetValue(clientContext.PendingRequest);
+                    if (propValue != null)
+                    {
+                        count = (propValue as System.Collections.Generic.List<ClientAction>).Count;
+                    }
+                }
+            }
+
+            return count;
         }
 
         /// <summary>
@@ -332,6 +560,60 @@ namespace Microsoft.SharePoint.Client
             }
             return (result);
         }
+
+#if ONPREMISES
+        /// <summary>
+        /// Checks if the used ClientContext is app-only
+        /// </summary>
+        /// <param name="clientContext">The ClientContext to inspect</param>
+        /// <returns>True if app-only, false otherwise</returns>
+        public static bool IsAppOnlyWithDelegation(this ClientRuntimeContext clientContext)
+        {
+            // Set initial result to false
+            var result = false;
+
+            // Try to get an access token from the current context
+            var accessToken = clientContext.GetAccessToken();
+
+            // If any
+            if (!String.IsNullOrEmpty(accessToken))
+            {
+                // Try to decode the access token
+                try
+                {
+                    var token = new JwtSecurityToken(accessToken);
+
+                    if (token.Audiences.Any(x => x.StartsWith(TokenHelper.SharePointPrincipal)))
+                    {
+
+                    }
+
+                    // Search for the UPN claim, to see if we have user's delegation
+                    var upn = token.Claims.FirstOrDefault(claim => claim.Type == "upn")?.Value;
+                    if (!String.IsNullOrEmpty(upn))
+                    {
+                        result = true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    throw new Exception("Maybe Newtonsoft.Json assembly is not loaded?", ex);
+                }
+            }
+            else if (clientContext.Credentials == null)
+            {
+                result = false;
+            }
+
+            // As a final check, do we have the auth cookies?
+            if (clientContext.HasAuthCookies())
+            {
+                result = false;
+            }
+
+            return (result);
+        }
+#endif
 
         /// <summary>
         /// Gets an access token from a <see cref="ClientContext"/> instance. Only works when using an add-in or app-only authentication flow.
@@ -395,6 +677,76 @@ namespace Microsoft.SharePoint.Client
             }
 
             hasAuthCookies = fedAuth && rtFa;
+        }
+        
+        /// <summary>
+        /// Gets the CookieCollection by cookie name = FedAuth or rtFa
+        /// </summary>
+        /// <param name="clientContext"></param>
+        /// <returns></returns>
+        internal static CookieCollection GetCookieCollection(this ClientRuntimeContext clientContext)
+        {
+            return GetCookieCollection(clientContext, new List<string>
+            {
+                "FedAuth", "rtFa"
+            });
+        }
+
+        /// <summary>
+        /// Gets the CookieCollection by the cookie name. If no cookieNames are passed in it returns all cookies
+        /// </summary>
+        /// <param name="clientContext"></param>
+        /// <param name="cookieNames"></param>
+        /// <returns></returns>
+        internal static CookieCollection GetCookieCollection(this ClientRuntimeContext clientContext, IReadOnlyCollection<string> cookieNames)
+        {
+            CookieCollection cookieCollection = null;
+
+            void Handler(object sender, WebRequestEventArgs e) 
+                => cookieCollection = HandleWebRequest(e, cookieNames);
+
+            clientContext.ExecutingWebRequest += Handler;
+            clientContext.ExecuteQuery();
+            clientContext.ExecutingWebRequest -= Handler;
+
+            return cookieCollection;
+        }
+
+        private static CookieCollection HandleWebRequest(WebRequestEventArgs e, IReadOnlyCollection<string> cookieNames = null)
+        {
+            var cookieCollection = new CookieCollection();
+
+            if (e.WebRequestExecutor?.WebRequest?.CookieContainer == null)
+            {
+                return null;
+            }
+
+            var cookies = e.WebRequestExecutor.WebRequest.CookieContainer
+                .GetCookies(e.WebRequestExecutor.WebRequest.RequestUri);
+
+            if (cookies.Count <= 0)
+            {
+                return null;
+            }
+
+            foreach (Cookie cookie in cookies)
+            {
+                if (cookie == null)
+                {
+                    continue;
+                }
+
+                if (cookieNames == null || !cookieNames.Any())
+                {
+                    cookieCollection.Add(cookie);
+                }
+                else if (cookieNames.Any(r => r.Equals(cookie.Name)))
+                {
+                    cookieCollection.Add(cookie);
+                }
+            }
+            
+            return cookieCollection;
         }
 
         /// <summary>
@@ -546,6 +898,14 @@ namespace Microsoft.SharePoint.Client
                     {
                         request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
                     }
+                    else
+                    {
+                        if (context.Credentials is NetworkCredential networkCredential)
+                        {
+                            handler.Credentials = networkCredential;
+                        }
+                    }
+
                     HttpResponseMessage response = await httpClient.SendAsync(request);
 
                     if (response.IsSuccessStatusCode)
@@ -554,13 +914,26 @@ namespace Microsoft.SharePoint.Client
                     }
                     else
                     {
-                        throw new Exception(await response.Content.ReadAsStringAsync());
+                        var errorSb = new System.Text.StringBuilder();
+
+                        errorSb.AppendLine(await response.Content.ReadAsStringAsync());
+                        if (response.Headers.Contains("SPRequestGuid"))
+                        {
+                            var values = response.Headers.GetValues("SPRequestGuid");
+                            if (values != null)
+                            {
+                                var spRequestGuid = values.FirstOrDefault();
+                                errorSb.AppendLine($"ServerErrorTraceCorrelationId: {spRequestGuid}");
+                            }
+                        }
+
+                        throw new Exception(errorSb.ToString());
                     }
                 }
                 var contextInformation = JsonConvert.DeserializeObject<dynamic>(responseString);
 
                 string formDigestValue = contextInformation.d.GetContextWebInformation.FormDigestValue;
-                return await Task.Run(() => formDigestValue);
+                return await Task.Run(() => formDigestValue).ConfigureAwait(false);
             }
         }
 
@@ -572,7 +945,7 @@ namespace Microsoft.SharePoint.Client
             }
         }
 
-#if !ONPREMISES
+#if !SP2013 && !SP2016
         /// <summary>
         /// BETA: Creates a Communication Site Collection
         /// </summary>
@@ -586,6 +959,21 @@ namespace Microsoft.SharePoint.Client
             return await SiteCollection.CreateAsync(clientContext, siteCollectionCreationInformation);
         }
 
+        /// <summary>
+        /// BETA: Creates a Team Site Collection with no group
+        /// </summary>
+        /// <param name="clientContext"></param>
+        /// <param name="siteCollectionCreationInformation"></param>
+        /// <returns></returns>
+        public static async Task<ClientContext> CreateSiteAsync(this ClientContext clientContext, TeamNoGroupSiteCollectionCreationInformation siteCollectionCreationInformation)
+        {
+            await new SynchronizationContextRemover();
+
+            return await SiteCollection.CreateAsync(clientContext, siteCollectionCreationInformation);
+        }
+#endif
+
+#if !ONPREMISES
         /// <summary>
         /// BETA: Creates a Team Site Collection
         /// </summary>
@@ -623,6 +1011,42 @@ namespace Microsoft.SharePoint.Client
             await new SynchronizationContextRemover();
 
             return await SiteCollection.AliasExistsAsync(clientContext, alias);
+        }
+
+        /// <summary>
+        /// Enable MS Teams team on a group connected team site
+        /// </summary>
+        /// <param name="clientContext"></param>
+        /// <returns></returns>
+        public static async Task<string> TeamifyAsync(this ClientContext clientContext)
+        {
+            await new SynchronizationContextRemover();
+
+            return await SiteCollection.TeamifySiteAsync(clientContext);
+        }
+
+        /// <summary>
+        /// Checks whether the teamify prompt is hidden in O365 Group connected sites
+        /// </summary>
+        /// <param name="clientContext">ClientContext of the site to operate against</param>
+        /// <returns></returns>
+        public static async Task<bool> IsTeamifyPromptHidden(this ClientContext clientContext)
+        {
+            await new SynchronizationContextRemover();
+
+            return await SiteCollection.IsTeamifyPromptHiddenAsync(clientContext);
+        }
+
+        /// <summary>
+        /// Hide the teamify prompt displayed in O365 group connected sites
+        /// </summary>
+        /// <param name="clientContext">ClientContext of the site to operate against</param>
+        /// <returns></returns>
+        public static async Task<bool> HideTeamifyPrompt(this ClientContext clientContext)
+        {
+            await new SynchronizationContextRemover();
+
+            return await SiteCollection.HideTeamifyPromptAsync(clientContext);
         }
 #endif
     }
